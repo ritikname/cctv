@@ -271,7 +271,7 @@ class GlobalIdentityManager:
     # ── Ambiguity Confidence Margin ───────────────────────────────────────────
     # If the difference between the best candidate score and the second-best candidate
     # score is less than this margin, the association is considered ambiguous and deferred.
-    CONFIDENCE_MARGIN = 0.06
+    CONFIDENCE_MARGIN = 0.08
 
     def __init__(self, camera_manager, require_candidate_motion: bool = True):
         self.camera_manager = camera_manager
@@ -916,6 +916,13 @@ class GlobalIdentityManager:
                                     if vlm_res2.get("match") and vlm_res2.get("confidence", 0.0) >= 0.70:
                                         second_rejected = False
                                 if second_rejected:
+                                    vlm_resolved = True
+                            elif second is not None:
+                                vlm_res2 = self.vlm_verifier.verify_candidate(query_crop, second["gid"])
+                                if vlm_res2.get("match") and vlm_res2.get("confidence", 0.0) >= 0.75:
+                                    top, second = second, top
+                                    gid = top["gid"]
+                                    comp = top["composite"]
                                     vlm_resolved = True
 
                     if not vlm_resolved:

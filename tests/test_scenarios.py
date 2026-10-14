@@ -2543,8 +2543,8 @@ class TestRobustIdentityAndVLMRegression(unittest.TestCase):
         from unittest.mock import MagicMock
 
         w, h = 1000, 1000
-        fA = _feat()
-        fB = _feat()  # distinct appearance so T-1 and T-2 get separate P-001 and P-002
+        fA = np.zeros(512, dtype=np.float32); fA[:200] = 1.0; fA /= np.linalg.norm(fA)
+        fB = np.zeros(512, dtype=np.float32); fB[100:300] = 1.0; fB /= np.linalg.norm(fB)
 
         # P-001 enters
         for fi in range(10, 20):
@@ -2560,7 +2560,7 @@ class TestRobustIdentityAndVLMRegression(unittest.TestCase):
         for fi in range(20, 30):
             t = fi * 0.1
             y = 350 + (fi - 20) * 30
-            det = [{'camera_id': 'cam1', 'track_id': 'T-2', 'bbox': (500, int(y - 90), 570, int(y)), 'conf': 0.95}]
+            det = [{'camera_id': 'cam1', 'track_id': 'T-2', 'bbox': (360, int(y - 90), 430, int(y)), 'conf': 0.95}]
             self.mgr.process_detections(det, {'T-2': fB}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h)
             ev = self.gate.check('T-2', det[0]['bbox'], w, h, timestamp=t, camera_id='cam1', feat=fB)
             if ev == "IN":
@@ -2585,15 +2585,14 @@ class TestRobustIdentityAndVLMRegression(unittest.TestCase):
         mock_vlm.verify_candidate = MagicMock(side_effect=mock_verify)
         self.mgr.set_vlm_verifier(mock_vlm)
 
-        # Ambiguous query feature close to both P-001 and P-002
-        f_query = 0.50 * fA + 0.50 * fB
-        f_query /= float(np.linalg.norm(f_query))
+        # Ambiguous query feature close to both P-001 and P-002 (sim=0.866, margin = 0.0)
+        f_query = (fA + fB) / np.linalg.norm(fA + fB)
 
-        # T-RECOV appears near center with crop
+        # T-RECOV appears equidistant between P-001 and P-002 with crop
         fake_crop = np.zeros((100, 50, 3), dtype=np.uint8)
-        det_query = [{'camera_id': 'cam1', 'track_id': 'T-QUERY', 'bbox': (310, 580, 380, 680), 'conf': 0.95, 'crop': fake_crop}]
+        det_query = [{'camera_id': 'cam1', 'track_id': 'T-QUERY', 'bbox': (330, 580, 400, 680), 'conf': 0.95, 'crop': fake_crop}]
         d_res = self.mgr.process_detections(
-            det_query, {'T-QUERY': f_query}, 4.5, 45,
+            det_query, {'T-QUERY': f_query}, 4.2, 42,
             gate_counter=self.gate, frame_w=w, frame_h=h
         )
 
