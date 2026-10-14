@@ -21,11 +21,17 @@ from app.reid.clothing import ClothingProfile, extract_clothing_features, compar
 
 
 # ── States ────────────────────────────────────────────────────────────────────
-ACTIVE           = "ACTIVE"
-TEMPORARILY_LOST = "TEMPORARILY_LOST"
-REIDENTIFIED     = "REIDENTIFIED"
-EXPIRED          = "EXPIRED"
-DEPARTED         = "DEPARTED"
+TENTATIVE          = "TENTATIVE"           # Detection or identity is not yet sufficiently confirmed
+ACTIVE             = "ACTIVE"              # A valid visitor identity and visit are established
+TEMPORARILY_LOST   = "TEMPORARILY_LOST"    # Person is no longer visible, but identity history is retained
+IDENTITY_UNCERTAIN = "IDENTITY_UNCERTAIN"  # Multiple candidates exist or confidence is ambiguous; deferred
+VISIT_COMPLETED    = "VISIT_COMPLETED"     # A valid exit has been confirmed
+HISTORICAL         = "HISTORICAL"          # Departed visitor retained in memory for returning visitor recognition
+REIDENTIFIED       = "REIDENTIFIED"        # Successfully recovered on this frame
+STATIC             = "STATIC"              # Stationary object/statue
+UNVERIFIED_OCCUPANT= "UNVERIFIED_OCCUPANT" # Pre-existing occupant present without observed entry
+DEPARTED           = "DEPARTED"            # Exited visitor status
+EXPIRED            = "EXPIRED"             # Identity exceeded maximum time gap
 
 
 def _compute_iou(boxA, boxB):
@@ -218,13 +224,12 @@ class GlobalPerson:
                     sim_check = self.gallery.best_similarity(embedding)
                     cloth_check = self.gallery.clothing_similarity(clothing) if clothing is not None else None
 
-                    # 1. High deep similarity -> safely add to corresponding view.
-                    if sim_check >= 0.60:
+                    # 1. High deep similarity -> safely add to corresponding view partition.
+                    if sim_check >= 0.62:
                         self.gallery.add(embedding, view_tag=view_tag, clothing=clothing)
                     # 2. Front-to-back turn during continuous tracking:
-                    # When a person turns, deep sim may drop to 0.35-0.60, but
-                    # clothing matches strongly (>= 0.52). Update multi-view gallery and clothing profile.
-                    elif cloth_check is not None and cloth_check >= 0.52 and sim_check >= 0.35:
+                    # Verified viewpoint change: clothing matches strongly and deep similarity is consistent
+                    elif cloth_check is not None and cloth_check >= 0.65 and sim_check >= 0.48:
                         self.gallery.add(embedding, view_tag=view_tag, clothing=clothing)
 
     def mark_reidentified(self, timestamp, cam_id, track_id, embedding, bbox, sim, clothing=None):
@@ -262,6 +267,11 @@ class GlobalIdentityManager:
     # When clothing profiles are unavailable, the gate is skipped (permissive).
     CLOTHING_MIN_GATE = 0.30  # veto threshold: below this → REJECT regardless of deep sim
 
+    # ── Ambiguity Confidence Margin ───────────────────────────────────────────
+    # If the difference between the best candidate score and the second-best candidate
+    # score is less than this margin, the association is considered ambiguous and deferred.
+    CONFIDENCE_MARGIN = 0.06
+
     def __init__(self, camera_manager, require_candidate_motion: bool = True):
         self.camera_manager = camera_manager
         self.require_candidate_motion = require_candidate_motion
@@ -282,11 +292,7 @@ class GlobalIdentityManager:
         return gid
 
     def get_reid_log(self, decision_filter=None):
-        """Return the Re-ID audit log, optionally filtered by decision type.
-        
-        decision_filter: None (all), 'ACCEPTED', 'REJECTED_THRESHOLD',
-                         'REJECTED_CLOTHING_GATE', or 'CANDIDATE'
-        """
+        """Return the Re-ID audit log, optionally filtered by decision type."""
         if decision_filter is None:
             return list(self.reid_log)
         return [e for e in self.reid_log if e.get("decision") == decision_filter]
@@ -294,19 +300,19 @@ class GlobalIdentityManager:
     def dump_reid_log(self, path: str):
         """Write the full Re-ID audit log to a CSV file for external analysis."""
         import csv, os
-        if not self.reid_log:
-            return
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         fieldnames = [
-            "frame", "ts", "query_tid", "candidate_gid",
+            "frame", "ts", "camera_id", "query_tid", "assigned_gid",
+            "candidate_gids", "best_candidate", "second_candidate",
             "deep_sim", "cloth_sim", "app_score", "sp_score",
-            "tp_score", "composite", "allow_gallery_update", "decision",
-            "min_composite", "min_app",
+            "tp_score", "composite", "margin", "decision", "reason",
+            "allow_gallery_update", "min_composite", "min_app",
         ]
         with open(path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
-            writer.writerows(self.reid_log)
+            if self.reid_log:
+                writer.writerows(self.reid_log)
 
     def terminate_visit(self, gid, timestamp, is_short=False):
         """
@@ -363,22 +369,28 @@ class GlobalIdentityManager:
             clothing = self.latest_clothing.get(tid)
 
         # Check if this person is a returning visitor who previously completed a visit
-        # within the configured retention window:
+        # within the configured retention window (including short visits where identity memory is preserved):
         departed_match = None
-        best_sim = 0.0
+        departed_candidates = []
         if feat is not None:
             retention_limit = getattr(Config, "VISITOR_RETENTION_TIME", 3600)
             strong_thresh = getattr(Config, "REID_STRONG_MATCH_THRESHOLD", 0.75)
             for gid, p in self.persons.items():
-                if p.is_departed and p.current_visit_status == "COMPLETED":
+                if p.is_departed and p.current_visit_status in ("COMPLETED", "SHORT_VISIT_IGNORED"):
                     if (timestamp - p.last_seen) <= retention_limit:
                         sim = p.gallery.best_similarity(feat)
                         if clothing and len(p.gallery.clothing_profiles) > 0:
                             c_sim = p.gallery.clothing_similarity(clothing)
                             sim = 0.70 * sim + 0.30 * c_sim
-                        if sim >= strong_thresh and sim > best_sim:
-                            best_sim = sim
-                            departed_match = p
+                        if sim >= strong_thresh:
+                            departed_candidates.append((sim, p))
+
+        departed_candidates.sort(key=lambda x: x[0], reverse=True)
+        if departed_candidates:
+            if len(departed_candidates) > 1 and (departed_candidates[0][0] - departed_candidates[1][0] < self.CONFIDENCE_MARGIN):
+                departed_match = None
+            else:
+                departed_match = departed_candidates[0][1]
 
         if departed_match is not None:
             # Genuine re-entry of previously known visitor! Start a new separate visit record:
@@ -457,6 +469,19 @@ class GlobalIdentityManager:
         active_tracks = {d['track_id'] for d in detections}
         decisions     = []
 
+        # ── Step 0: Immediate Lost and Expire State Update ──────────────────
+        # Mark missing tracks TEMPORARILY_LOST immediately so they are eligible for
+        # recovery during Re-ID in the current frame without race conditions.
+        for gid, p in self.persons.items():
+            if p.status in (ACTIVE, REIDENTIFIED):
+                if p.current_track_id not in active_tracks:
+                    p.mark_lost()
+
+        for gid, p in self.persons.items():
+            if p.status == TEMPORARILY_LOST:
+                if (timestamp - p.last_seen) > Config.MAX_REID_TIME_GAP:
+                    p.mark_expired()
+
         # ── 0. Update Co-Presence / Simultaneous-Visibility Graph ───────────
         # Any tracks visible in the SAME frame can NEVER be the same person!
         track_list = list(active_tracks)
@@ -491,7 +516,7 @@ class GlobalIdentityManager:
                 gid = self.local_to_global[tid]
                 p = self.persons.get(gid)
                 # If this visitor already departed, do NOT treat as active known visitor!
-                if p and p.is_departed:
+                if p and (p.is_departed or p.status in (EXPIRED, DEPARTED, VISIT_COMPLETED)):
                     unknown_dets.append(det)
                 else:
                     known_dets.append(det)
@@ -531,7 +556,6 @@ class GlobalIdentityManager:
             fy = float(by2)
 
             if tid not in self.candidates:
-                # Check if this detection is already inside when first appearing
                 is_preexisting_inside = False
                 if active_gate is not None and hasattr(active_gate, "is_inside_or_entering"):
                     is_preexisting_inside = active_gate.is_inside_or_entering(tid, det['bbox'], frame_w, frame_h)
@@ -555,7 +579,7 @@ class GlobalIdentityManager:
             cand["head_pts"].append((hx, hy))
             cand["foot_pts"].append((fx, fy))
 
-        # ── 3. Re-ID unknown tracks (COMPOSITE scoring) ──────────────────
+        # ── 3. Re-ID unknown tracks (COMPOSITE scoring & Margin Gating) ───
         if unknown_dets:
             currently_active_on_cam = defaultdict(set)
             for det in known_dets:
@@ -563,31 +587,32 @@ class GlobalIdentityManager:
                 gid = self.local_to_global[tid]
                 currently_active_on_cam[det['camera_id']].add(gid)
 
-            all_candidates = []
+            query_candidates = {}
+
             for q_idx, det in enumerate(unknown_dets):
                 tid     = det['track_id']
                 cam_id  = det['camera_id']
                 feat    = features_map.get(tid)
                 q_bbox  = det['bbox']
+                q_cloth = clothing_map.get(tid)
                 
                 # Rule 1: Static candidate (statue / mannequin) can NEVER be Re-ID matched!
                 cand = self.candidates.get(tid)
                 if cand and cand.get("is_static", False):
-                    all_candidates.append([])
                     continue
 
                 # Rule 2: Initial staff/occupant present before entries began can NEVER be Re-ID matched!
                 if cand and cand.get("is_initial_occupant", False):
-                    all_candidates.append([])
                     continue
 
                 # Rule 3: Do not attempt Re-ID with poor quality crop
                 quality = self._compute_quality(q_bbox)
                 if feat is None or quality < 0.20:
-                    all_candidates.append([])
                     continue
 
-                row = []
+                evaluated_gids = []
+                cands_for_q = []
+
                 for gid, p in self.persons.items():
                     if p.gallery.is_empty():
                         continue
@@ -604,31 +629,57 @@ class GlobalIdentityManager:
                         continue
 
                     # Rule 6: Person has EXPIRED or DEPARTED or visit terminated
-                    if p.status in (EXPIRED, DEPARTED) or p.is_departed:
+                    if p.status in (EXPIRED, DEPARTED, VISIT_COMPLETED) or p.is_departed:
                         continue
 
                     if getattr(p, "current_visit_status", None) in ("SHORT_VISIT_IGNORED", "COMPLETED"):
                         continue
 
-                    # Rule 7: SIMULTANEOUS VISIBILITY CHECK
-                    # If tid and gid (or p) were ever visible at the same time, REJECT!
+                    # Rule 7: SIMULTANEOUS VISIBILITY CHECK (Co-presence Graph)
                     if (tid in p.co_present_track_ids or 
                         tid in self.co_present_tracks.get(gid, set()) or 
                         gid in self.co_present_tracks.get(tid, set())):
+                        self.reid_log.append({
+                            "frame": frame_idx, "ts": round(timestamp, 3),
+                            "camera_id": cam_id, "query_tid": tid, "assigned_gid": None,
+                            "candidate_gids": [gid], "best_candidate": gid, "second_candidate": None,
+                            "deep_sim": None, "cloth_sim": None, "app_score": None, "sp_score": None,
+                            "tp_score": None, "composite": None, "margin": None,
+                            "decision": "REJECTED_CO_PRESENCE",
+                            "reason": f"Track {tid} and person {gid} were simultaneously visible in the same frame",
+                            "allow_gallery_update": False,
+                        })
                         continue
+
+                    # Rule 7.5: Unverified occupant check
+                    # A previously unverified person must NEVER inherit another visitor's P-ID
+                    # unless there is strong, unambiguous evidence of genuine visitor recovery.
+                    if cand and cand.get("is_unverified_occupant", False):
+                        cand_first = cand.get("first_seen", timestamp)
+                        # If candidate was already present inside before p entered or while p was active:
+                        if cand_first < p.first_seen or cand_first < (p.last_seen - 0.2):
+                            self.reid_log.append({
+                                "frame": frame_idx, "ts": round(timestamp, 3),
+                                "camera_id": cam_id, "query_tid": tid, "assigned_gid": None,
+                                "candidate_gids": [gid], "best_candidate": gid, "second_candidate": None,
+                                "deep_sim": None, "cloth_sim": None, "app_score": None, "sp_score": None,
+                                "tp_score": None, "composite": None, "margin": None,
+                                "decision": "REJECTED_UNVERIFIED_PRIOR_PRESENCE",
+                                "reason": f"Track {tid} was already present inside before/during person {gid}'s presence",
+                                "allow_gallery_update": False,
+                            })
+                            continue
 
                     # Rule 8: Physical Store Invariants (gate counter)
                     if active_gate is not None:
-                        # Exited or departed person cannot be inside
                         if gid in getattr(active_gate, "departed_persons", set()) or active_gate.person_state.get(gid) == "OUTSIDE":
                             continue
                         p_is_inside = (active_gate.person_state.get(gid) == "INSIDE" or
-                                       active_gate.person_state.get(p.current_track_id) == "INSIDE")
+                                       active_gate.person_state.get(p.current_track_id) == "INSIDE" or
+                                       (p.last_bbox is not None and active_gate.is_inside_or_entering(p.current_track_id, p.last_bbox, frame_w, frame_h)))
                         q_is_inside = active_gate.is_inside_or_entering(tid, q_bbox, frame_w, frame_h)
-                        # A person currently inside cannot suddenly appear outside
                         if p_is_inside and not q_is_inside:
                             continue
-                        # A person outside cannot match a track deep inside without crossing
                         if not p_is_inside and q_is_inside:
                             continue
 
@@ -645,6 +696,16 @@ class GlobalIdentityManager:
                         eff_gap = max(0.1, time_gap)
                         speed = disp / eff_gap
                         if time_gap < 2.0 and speed > 800.0:
+                            self.reid_log.append({
+                                "frame": frame_idx, "ts": round(timestamp, 3),
+                                "camera_id": cam_id, "query_tid": tid, "assigned_gid": None,
+                                "candidate_gids": [gid], "best_candidate": gid, "second_candidate": None,
+                                "deep_sim": None, "cloth_sim": None, "app_score": None, "sp_score": None,
+                                "tp_score": None, "composite": None, "margin": None,
+                                "decision": "REJECTED_SPATIAL_SPEED",
+                                "reason": f"Displacement {disp:.1f}px in {eff_gap:.2f}s ({speed:.1f} px/s) exceeds speed threshold",
+                                "allow_gallery_update": False,
+                            })
                             continue
                         if time_gap < 2.0:
                             sp_score = _spatial_score(p.last_bbox, q_bbox, self._frame_diag)
@@ -652,193 +713,207 @@ class GlobalIdentityManager:
                             # Smooth turn in place or localized step: strong spatial continuity
                             sp_score = 0.75
                         else:
-                            sp_score = 0.5
+                            sp_score = max(0.20, _spatial_score(p.last_bbox, q_bbox, self._frame_diag))
                     else:
-                        sp_score = 0.5
+                        sp_score = 0.50
+
+                    evaluated_gids.append(gid)
 
                     # Appearance & Clothing Fused Score
                     deep_sim = p.gallery.best_similarity(feat) if feat is not None else 0.0
-                    q_cloth = clothing_map.get(tid)
                     cloth_sim = p.gallery.clothing_similarity(q_cloth) if (q_cloth is not None and len(p.gallery.clothing_profiles) > 0) else None
 
-                    # ── CLOTHING GATE VETO ────────────────────────────────────
-                    # If a clothing profile exists for the gallery person AND the
-                    # query, reject the match outright if clothing similarity is
-                    # below the gate threshold. This is the primary defence
-                    # against cross-person identity transfer.
-                    clothing_gate_ok = True
-                    if cloth_sim is not None:
-                        if cloth_sim < self.CLOTHING_MIN_GATE:
-                            clothing_gate_ok = False
-
-                    if not clothing_gate_ok:
-                        # Log the rejection for auditability
+                    # ── CLOTHING GATE VETO ──
+                    if cloth_sim is not None and cloth_sim < self.CLOTHING_MIN_GATE:
                         self.reid_log.append({
                             "frame": frame_idx, "ts": round(timestamp, 3),
-                            "query_tid": tid, "candidate_gid": gid,
-                            "deep_sim": round(deep_sim, 4),
-                            "cloth_sim": round(cloth_sim, 4) if cloth_sim is not None else None,
+                            "camera_id": cam_id, "query_tid": tid, "assigned_gid": None,
+                            "candidate_gids": [gid], "best_candidate": gid, "second_candidate": None,
+                            "deep_sim": round(deep_sim, 4), "cloth_sim": round(cloth_sim, 4),
+                            "app_score": None, "sp_score": round(sp_score, 4), "tp_score": None,
+                            "composite": None, "margin": None,
                             "decision": "REJECTED_CLOTHING_GATE",
+                            "reason": f"Clothing similarity {cloth_sim:.3f} below gate threshold {self.CLOTHING_MIN_GATE}",
+                            "allow_gallery_update": False,
+                        })
+                        continue
+
+                    # ── SIMILAR CLOTHING ALONE MUST NEVER MATCH ──
+                    if cloth_sim is not None and cloth_sim >= 0.70 and deep_sim < 0.42:
+                        self.reid_log.append({
+                            "frame": frame_idx, "ts": round(timestamp, 3),
+                            "camera_id": cam_id, "query_tid": tid, "assigned_gid": None,
+                            "candidate_gids": [gid], "best_candidate": gid, "second_candidate": None,
+                            "deep_sim": round(deep_sim, 4), "cloth_sim": round(cloth_sim, 4),
+                            "app_score": None, "sp_score": round(sp_score, 4), "tp_score": None,
+                            "composite": None, "margin": None,
+                            "decision": "REJECTED_THRESHOLD",
+                            "reason": f"Similar clothing color ({cloth_sim:.3f}) cannot force match without sufficient deep similarity ({deep_sim:.3f} < 0.42)",
+                            "allow_gallery_update": False,
                         })
                         continue
 
                     if cloth_sim is not None:
-                        if cloth_sim < 0.40:
-                            # Significant clothing mismatch: penalise appearance score
+                        if cloth_sim < 0.45:
                             app_score = min(deep_sim * 0.5, 0.35)
                         elif deep_sim >= 0.65 and cloth_sim >= 0.55:
-                            # Both deep feature and clothing match strongly
-                            app_score = max(deep_sim, 0.60 * deep_sim + 0.40 * cloth_sim)
-                        elif cloth_sim >= 0.48 and deep_sim >= 0.35:
-                            # Front-to-back turn or viewpoint change of same person:
-                            # Clothing colors provide robust view-invariant signal.
-                            # Combined confidence scales so genuine returning visitors recover.
-                            app_score = max(deep_sim, min(1.0, 0.45 * deep_sim + 0.55 * cloth_sim + 0.26))
-                        else:
                             app_score = 0.60 * deep_sim + 0.40 * cloth_sim
+                        elif cloth_sim >= 0.65 and deep_sim >= 0.45:
+                            # Front-to-back turn or viewpoint change of same person
+                            app_score = 0.45 * deep_sim + 0.55 * cloth_sim
+                        else:
+                            app_score = 0.65 * deep_sim + 0.35 * cloth_sim
                     else:
                         app_score = deep_sim
 
                     tp_score = _temporal_score(time_gap)
-
                     composite = (self.W_APPEARANCE * app_score
                                  + self.W_SPATIAL * sp_score
                                  + self.W_TEMPORAL * tp_score)
 
-                    # Log candidate match for audit
-                    self.reid_log.append({
-                        "frame": frame_idx, "ts": round(timestamp, 3),
-                        "query_tid": tid, "candidate_gid": gid,
-                        "deep_sim": round(deep_sim, 4),
-                        "cloth_sim": round(cloth_sim, 4) if cloth_sim is not None else None,
-                        "app_score": round(app_score, 4),
-                        "sp_score": round(sp_score, 4),
-                        "tp_score": round(tp_score, 4),
-                        "composite": round(composite, 4),
-                        "decision": "CANDIDATE",
+                    cands_for_q.append({
+                        "gid": gid,
+                        "composite": composite,
+                        "app_score": app_score,
+                        "cloth_sim": cloth_sim,
+                        "deep_sim": deep_sim,
+                        "sp_score": sp_score,
+                        "tp_score": tp_score,
                     })
 
-                    row.append((composite, app_score, cloth_sim, gid))
+                if cands_for_q:
+                    cands_for_q.sort(key=lambda x: x["composite"], reverse=True)
+                    query_candidates[q_idx] = {
+                        "candidates": cands_for_q,
+                        "evaluated_gids": evaluated_gids,
+                        "det": det,
+                    }
 
-                all_candidates.append(row)
-
-            # Greedy assignment: highest composite first
-            flat = []
-            for q_idx, row in enumerate(all_candidates):
-                for composite, app_score, cloth_sim, gid in row:
-                    flat.append((composite, app_score, cloth_sim, q_idx, gid))
-            flat.sort(reverse=True)
-
-            # Safe Ambiguity Detection (Requirement 4):
-            # Defer match if multiple candidates compete with near-identical composite scores
-            ambiguous_qdx  = set()
+            # ── Ambiguity & Margin Evaluation ──
+            ambiguous_qdx = set()
             ambiguous_gids = set()
+            query_top_info = {}
 
-            q_matches = defaultdict(list)
-            g_matches = defaultdict(list)
-            for composite, app_score, cloth_sim, q_idx, gid in flat:
-                p = self.persons[gid]
+            for q_idx, data in query_candidates.items():
+                cands = data["candidates"]
+                top = cands[0]
+                second = cands[1] if len(cands) > 1 else None
+
+                p = self.persons[top["gid"]]
                 min_c = 0.52 if p.status == TEMPORARILY_LOST else 0.56
                 min_a = getattr(Config, "ACTIVE_VISITOR_REID_THRESHOLD", 0.75) if p.status == TEMPORARILY_LOST else getattr(Config, "REID_MATCH_THRESHOLD", 0.75)
-                if composite >= min_c and app_score >= min_a:
-                    q_matches[q_idx].append(composite)
-                    g_matches[gid].append(composite)
 
-            for q_idx, comps in q_matches.items():
-                if len(comps) >= 2:
-                    comps.sort(reverse=True)
-                    if (comps[0] - comps[1]) < 0.035:
+                if second is not None:
+                    margin = float(top["composite"] - second["composite"])
+                    if second["composite"] >= (min_c - 0.08) and margin < self.CONFIDENCE_MARGIN:
                         ambiguous_qdx.add(q_idx)
+                        ambiguous_gids.add(top["gid"])
+                        ambiguous_gids.add(second["gid"])
+                else:
+                    margin = 1.0
 
-            for gid, comps in g_matches.items():
-                if len(comps) >= 2:
-                    comps.sort(reverse=True)
-                    if (comps[0] - comps[1]) < 0.035:
+                query_top_info[q_idx] = (top, second, margin, min_c, min_a)
+
+            # Cross-query competition: check if multiple queries compete for the same candidate
+            gid_to_competing_queries = defaultdict(list)
+            for q_idx, (top, second, margin, min_c, min_a) in query_top_info.items():
+                if top["composite"] >= min_c and top["app_score"] >= min_a:
+                    gid_to_competing_queries[top["gid"]].append((top["composite"], q_idx))
+
+            for gid, q_list in gid_to_competing_queries.items():
+                if len(q_list) >= 2:
+                    q_list.sort(key=lambda x: x[0], reverse=True)
+                    margin = q_list[0][0] - q_list[1][0]
+                    if margin < self.CONFIDENCE_MARGIN:
+                        for _, q_idx in q_list:
+                            ambiguous_qdx.add(q_idx)
                         ambiguous_gids.add(gid)
 
+            # ── Safe One-to-One Association ──
             assigned_qdx  = set()
             assigned_gids = set()
 
-            for composite, app_score, cloth_sim, q_idx, gid in flat:
+            ranked_assignments = []
+            for q_idx, (top, second, margin, min_c, min_a) in query_top_info.items():
+                ranked_assignments.append((top["composite"], q_idx, top, second, margin, min_c, min_a))
+            ranked_assignments.sort(key=lambda x: x[0], reverse=True)
+
+            for comp, q_idx, top, second, margin, min_c, min_a in ranked_assignments:
+                tid = unknown_dets[q_idx]['track_id']
+                gid = top["gid"]
+                cam_id = unknown_dets[q_idx]['camera_id']
+                evaluated_gids = query_candidates[q_idx]["evaluated_gids"]
+
                 if q_idx in assigned_qdx or gid in assigned_gids:
                     continue
 
-                # Ambiguity protection: if candidates are ambiguous, defer rather than force!
                 if q_idx in ambiguous_qdx or gid in ambiguous_gids:
-                    continue
-
-                det = unknown_dets[q_idx]
-                cam_id = det['camera_id']
-                p = self.persons[gid]
-                candidate_time_gap = timestamp - p.last_seen
-
-                min_composite = 0.56
-                min_app = getattr(Config, "REID_MATCH_THRESHOLD", 0.75)
-
-                # For active registered visitors recovering after temporary disappearance:
-                if p.status == TEMPORARILY_LOST:
-                    min_composite = 0.52
-                    min_app = getattr(Config, "ACTIVE_VISITOR_REID_THRESHOLD", 0.75)
-                elif p.current_camera == cam_id and candidate_time_gap <= 20.0:
-                    min_composite = 0.56
-                    min_app = getattr(Config, "REID_MATCH_THRESHOLD", 0.75)
-
-                # Reject uncertain matches!
-                if composite < min_composite or app_score < min_app:
-                    # Log final rejection
+                    # Defer ambiguous match! Never force an unreliable assignment
                     self.reid_log.append({
                         "frame": frame_idx, "ts": round(timestamp, 3),
-                        "query_tid": det['track_id'], "candidate_gid": gid,
-                        "composite": round(composite, 4), "app_score": round(app_score, 4),
-                        "cloth_sim": round(cloth_sim, 4) if cloth_sim is not None else None,
-                        "decision": "REJECTED_THRESHOLD",
-                        "min_composite": min_composite, "min_app": min_app,
+                        "camera_id": cam_id, "query_tid": tid, "assigned_gid": None,
+                        "candidate_gid": gid,
+                        "candidate_gids": evaluated_gids, "best_candidate": gid,
+                        "second_candidate": second["gid"] if second else None,
+                        "deep_sim": round(top["deep_sim"], 4), "cloth_sim": round(top["cloth_sim"], 4) if top["cloth_sim"] is not None else None,
+                        "app_score": round(top["app_score"], 4), "sp_score": round(top["sp_score"], 4),
+                        "tp_score": round(top["tp_score"], 4), "composite": round(comp, 4),
+                        "margin": round(margin, 4),
+                        "decision": "DEFERRED",
+                        "reason": f"Ambiguous candidates (margin {margin:.3f} < {self.CONFIDENCE_MARGIN}); deferred to prevent identity swap",
+                        "allow_gallery_update": False,
+                        "min_composite": min_c, "min_app": min_a,
                     })
                     continue
 
-                tid  = det['track_id']
+                # Threshold check
+                if top["composite"] < min_c or top["app_score"] < min_a:
+                    self.reid_log.append({
+                        "frame": frame_idx, "ts": round(timestamp, 3),
+                        "camera_id": cam_id, "query_tid": tid, "assigned_gid": None,
+                        "candidate_gid": gid,
+                        "candidate_gids": evaluated_gids, "best_candidate": gid,
+                        "second_candidate": second["gid"] if second else None,
+                        "deep_sim": round(top["deep_sim"], 4), "cloth_sim": round(top["cloth_sim"], 4) if top["cloth_sim"] is not None else None,
+                        "app_score": round(top["app_score"], 4), "sp_score": round(top["sp_score"], 4),
+                        "tp_score": round(top["tp_score"], 4), "composite": round(comp, 4),
+                        "margin": round(margin, 4),
+                        "decision": "REJECTED_THRESHOLD",
+                        "reason": f"Composite {comp:.3f} < {min_c} or app_score {top['app_score']:.3f} < {min_a}",
+                        "allow_gallery_update": False,
+                        "min_composite": min_c, "min_app": min_a,
+                    })
+                    continue
+
+                # ACCEPT MATCH
+                p = self.persons[gid]
+                det = unknown_dets[q_idx]
                 feat = features_map.get(tid)
                 match_cloth = clothing_map.get(tid)
+                quality = self._compute_quality(det['bbox'])
 
-                # ── Gallery contamination protection ──────────────────────────
-                # Only update the gallery with this new embedding if the match
-                # is high-quality. Low-confidence matches (barely above threshold)
-                # must NOT pollute the gallery with a potentially wrong person's
-                # features. This prevents a wrong match from cascading and causing
-                # all future matches to also be wrong.
+                # ── Gallery contamination protection ──
                 allow_gallery_update = (
-                    app_score >= 0.75 and composite >= 0.60
+                    top["app_score"] >= 0.75 and
+                    top["composite"] >= 0.62 and
+                    margin >= 0.08 and
+                    quality >= 0.25 and
+                    tid not in occluded_tracks
                 )
 
                 if p.current_track_id in self.local_to_global:
                     if self.local_to_global[p.current_track_id] == gid:
                         del self.local_to_global[p.current_track_id]
 
-                # Mark re-identified; gallery update gated by quality
                 if not allow_gallery_update:
-                    # Suppress embedding update: pass None for feat and clothing
-                    p.mark_reidentified(
-                        timestamp, det['camera_id'], tid, None,
-                        det['bbox'], composite, clothing=None)
+                    p.mark_reidentified(timestamp, det['camera_id'], tid, None, det['bbox'], comp, clothing=None)
                 else:
-                    p.mark_reidentified(
-                        timestamp, det['camera_id'], tid, feat,
-                        det['bbox'], composite, clothing=match_cloth)
+                    p.mark_reidentified(timestamp, det['camera_id'], tid, feat, det['bbox'], comp, clothing=match_cloth)
 
                 self.local_to_global[tid] = gid
                 assigned_qdx.add(q_idx)
                 assigned_gids.add(gid)
                 currently_active_on_cam[det['camera_id']].add(gid)
-
-                # Log accepted match
-                self.reid_log.append({
-                    "frame": frame_idx, "ts": round(timestamp, 3),
-                    "query_tid": tid, "candidate_gid": gid,
-                    "composite": round(composite, 4), "app_score": round(app_score, 4),
-                    "cloth_sim": round(cloth_sim, 4) if cloth_sim is not None else None,
-                    "allow_gallery_update": allow_gallery_update,
-                    "decision": "ACCEPTED",
-                })
 
                 if tid in self.candidates:
                     del self.candidates[tid]
@@ -848,18 +923,44 @@ class GlobalIdentityManager:
                     active_gate.person_state[gid] = "INSIDE"
                     active_gate.person_state[tid] = "INSIDE"
 
-                decisions.append({
-                    "track_id": tid, "global_id": gid,
-                    "state": REIDENTIFIED, "sim": composite
+                self.reid_log.append({
+                    "frame": frame_idx, "ts": round(timestamp, 3),
+                    "camera_id": cam_id, "query_tid": tid, "assigned_gid": gid,
+                    "candidate_gid": gid,
+                    "candidate_gids": evaluated_gids, "best_candidate": gid,
+                    "second_candidate": second["gid"] if second else None,
+                    "deep_sim": round(top["deep_sim"], 4), "cloth_sim": round(top["cloth_sim"], 4) if top["cloth_sim"] is not None else None,
+                    "app_score": round(top["app_score"], 4), "sp_score": round(top["sp_score"], 4),
+                    "tp_score": round(top["tp_score"], 4), "composite": round(comp, 4),
+                    "margin": round(margin, 4),
+                    "decision": "ACCEPTED",
+                    "reason": f"Accepted 1-to-1 match to {gid} with composite {comp:.3f} and margin {margin:.3f}",
+                    "allow_gallery_update": allow_gallery_update,
+                    "min_composite": min_c, "min_app": min_a,
                 })
 
-            # Remaining → new persons
+                decisions.append({
+                    "track_id": tid, "global_id": gid,
+                    "state": REIDENTIFIED, "sim": comp
+                })
+
+            # ── 4. Unassigned unknown detections lifecycle ──
             for q_idx, det in enumerate(unknown_dets):
                 if q_idx in assigned_qdx:
                     continue
                 tid  = det['track_id']
                 feat = features_map.get(tid)
-                
+
+                # Check if deferred due to ambiguity:
+                if q_idx in ambiguous_qdx:
+                    top_cand = query_top_info.get(q_idx, ({} , None, 0.0, 0, 0))[0]
+                    sim_val = top_cand.get("composite", 0.0) if isinstance(top_cand, dict) else 0.0
+                    decisions.append({
+                        "track_id": tid, "global_id": tid,
+                        "state": IDENTITY_UNCERTAIN, "sim": sim_val
+                    })
+                    continue
+
                 # ── Candidate Wait Logic with Statue / Mannequin Dynamic Evaluation ──
                 bx1, by1, bx2, by2 = det['bbox']
                 hx = (bx1 + bx2) / 2.0
@@ -887,10 +988,16 @@ class GlobalIdentityManager:
                     self.candidates[tid] = cand
 
                 if not self.require_candidate_motion:
-                    if active_gate is not None and cand.get("is_unverified_occupant", False):
+                    if active_gate is not None:
+                        is_inside = False
+                        if hasattr(active_gate, "is_inside_or_entering"):
+                            is_inside = active_gate.is_inside_or_entering(tid, det['bbox'], frame_w, frame_h)
+                        elif hasattr(active_gate, "person_state"):
+                            is_inside = (active_gate.person_state.get(tid) == "INSIDE")
+                        state_lbl = "UNVERIFIED_OCCUPANT" if cand.get("is_unverified_occupant", False) else ("INSIDE" if is_inside else "OUTSIDE")
                         decisions.append({
                             "track_id": tid, "global_id": tid,
-                            "state": "UNVERIFIED_OCCUPANT", "sim": 0.0
+                            "state": state_lbl, "sim": 0.0
                         })
                         continue
                     # Test mode without motion requirement: promote immediately
@@ -953,8 +1060,6 @@ class GlobalIdentityManager:
                         continue
                 else:
                     # Evaluate if candidate is stationary (standing still)
-                    # A walking human travels > 30-100 pixels in 2-3 seconds.
-                    # A statue / standing person has head_travel < 20, foot_travel < 25, head_radius < 18
                     is_stationary = (head_travel < 20.0 and foot_travel < 25.0 and head_radius < 18.0)
                     time_alive = timestamp - cand["first_seen"]
                     if is_stationary:
@@ -990,7 +1095,6 @@ class GlobalIdentityManager:
                 # ── Gate / Store Admission Check ──
                 # When a gate counter is active, permanent visitor IDs (P-001, P-002...)
                 # are assigned ONLY upon genuine entry crossing via promote_track_to_visitor()!
-                # Temporary tracks (approaching, outside, or already inside) remain as temporary tracking IDs.
                 active_gate = gate_counter or self.gate_counter
                 if active_gate is not None:
                     is_inside = False
@@ -1028,17 +1132,5 @@ class GlobalIdentityManager:
             stale_tids = [t for t, c in self.candidates.items() if (timestamp - c.get("last_seen", c.get("first_seen", 0.0))) > 5.0]
             for t in stale_tids:
                 del self.candidates[t]
-
-        # ── 4. Mark lost ──────────────────────────────────────────────────
-        for gid, p in self.persons.items():
-            if p.status in (ACTIVE, REIDENTIFIED):
-                if p.current_track_id not in active_tracks:
-                    p.mark_lost()
-
-        # ── 5. Expire ────────────────────────────────────────────────────
-        for gid, p in self.persons.items():
-            if p.status == TEMPORARILY_LOST:
-                if (timestamp - p.last_seen) > Config.MAX_REID_TIME_GAP:
-                    p.mark_expired()
 
         return decisions

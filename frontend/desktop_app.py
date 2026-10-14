@@ -109,17 +109,9 @@ class VideoProcessorThread(QObject):
                 # ── 1. Local Tracking ──────────────────────────────────────
                 raw_detections = self.processor.trackers[cam_id].process_frame(frame)
 
-                # ── ROI Filter: Keep ONLY humans inside Active Tracking Area ──
-                detections = []
-                for det in raw_detections:
-                    bx1, by1, bx2, by2 = det['bbox']
-                    foot_x = (bx1 + bx2) / 2.0
-                    foot_y = float(by2)
-
-                    # Humans outside the active area lines are ignored completely
-                    # Allow slight margin at bottom border so visible bodies aren't abruptly dropped
-                    if (rx1 - 20) <= foot_x <= (rx2 + 20) and ry1 <= foot_y <= min(frame_h, ry2 + 40):
-                        detections.append(det)
+                # ── Keep all detections for global co-presence, candidate motion, and unverified tracking ──
+                # Ensure ROI filtering does not discard observations needed to establish co-visibility
+                detections = raw_detections
 
                 # ── 2. Selective Feature Extraction (rolling gallery) ──────
                 features_map     = {}
@@ -179,22 +171,18 @@ class VideoProcessorThread(QObject):
                     else:
                         person_key = tid
 
-                    event = self.tripwire.check(person_key, det['bbox'], frame_w, frame_h, is_static=is_static_person, timestamp=timestamp)
-                    if event == "IN":
-                        if not person_key.startswith("P-"):
-                            # Foot point genuinely crossed entry line! Promote track to permanent visitor ID
-                            new_gid = id_mgr.promote_track_to_visitor(
-                                tid, timestamp, cam_id, features_map.get(tid), det['bbox']
-                            )
-                            self.tripwire.transfer_identity(tid, new_gid)
-                            self.tripwire.register_entry(new_gid, timestamp)
-                            active_gids.add(new_gid)
-                            dec['global_id'] = new_gid
+                    event = self.tripwire.check(
+                        person_key, det['bbox'], frame_w, frame_h,
+                        is_static=is_static_person, timestamp=timestamp,
+                        camera_id=cam_id, feat=features_map.get(tid)
+                    )
+                    # Sync promoted or active persistent ID
+                    current_gid = id_mgr.local_to_global.get(tid, gid)
+                    if current_gid and current_gid.startswith("P-"):
+                        active_gids.add(current_gid)
+                        dec['global_id'] = current_gid
+                        if event == "IN":
                             dec['state'] = "NEW"
-                        else:
-                            active_gids.add(person_key)
-                    elif person_key.startswith("P-"):
-                        active_gids.add(person_key)
 
                 # Check doorway departures among registered people who were inside and departed through the door
                 lost_gids = set(id_mgr.persons.keys()) - active_gids

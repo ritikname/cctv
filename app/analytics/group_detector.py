@@ -54,6 +54,9 @@ class GroupDetector:
     def record_entry(self, person_id: str, timestamp: float):
         """Record an official entry timestamp for an individually tracked person."""
         self.entry_times[person_id] = timestamp
+        # Clear previous visit group status so returning visitor can participate in a new group
+        self.groups.pop(person_id, None)
+        self.recent_exits = [(pid, ts) for pid, ts in self.recent_exits if pid != person_id]
 
     def record_exit(self, person_id: str, timestamp: float):
         """

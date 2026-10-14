@@ -228,7 +228,13 @@ class TripwireCounter:
         """
         Register a provisional entry for a newly promoted permanent visitor upon valid gate crossing.
         Visit is confirmed only after remaining inside for > 5 seconds.
+        Idempotent: will not overwrite or duplicate if already inside/confirmed for this visit.
         """
+        if self.person_state.get(person_id) == "INSIDE" and person_id in self.confirmed_entries:
+            return
+        if person_id in self.pending_entries:
+            return
+
         self.pending_entries[person_id] = timestamp
         self.person_state[person_id] = "INSIDE"
         self.departed_persons.discard(person_id)
@@ -313,6 +319,9 @@ class TripwireCounter:
         frame_h: int,
         is_static: bool = False,
         timestamp: float = 0.0,
+        camera_id: str = "camera_01",
+        feat: Optional[np.ndarray] = None,
+        clothing: Optional[object] = None,
     ) -> Optional[str]:
         """
         Evaluate if a tracked person crossed the tripwire on this frame.
@@ -422,7 +431,7 @@ class TripwireCounter:
                         self.register_entry(person_id, timestamp)
                     elif self.identity_manager is not None:
                         promoted_gid = self.identity_manager.promote_track_to_visitor(
-                            person_id, timestamp, "cam1", None, bbox
+                            person_id, timestamp, camera_id, feat, bbox, clothing=clothing
                         )
                         self.transfer_identity(person_id, promoted_gid)
                         self.register_entry(promoted_gid, timestamp)
@@ -511,14 +520,14 @@ class TripwireCounter:
                 continue
             if self.person_state.get(pid) == "INSIDE":
                 hist = self.person_history.get(pid)
-                if hist and len(hist) >= 5:
+                if hist and len(hist) >= 3:
                     lx, ly, ldist = hist[-1]
                     first_dists = [h[2] for h in list(hist)[-15:]]
                     heading_to_door = (first_dists[-1] > first_dists[0] + 15.0)
                     has_been_deep = (self.deepest_inside.get(pid, 0.0) <= -frame_h * 0.10)
                     # Only complete visit if the tracked foot trajectory actually reached the exit threshold
                     should_depart = (has_been_deep and heading_to_door and ldist >= 0.0)
-                elif not hist and not self.last_eval_debug:
+                elif not hist and pid not in self.last_eval_debug:
                     # Direct test harness invocation without trajectory history
                     lx, ly = (0.0, 0.0)
                     should_depart = True

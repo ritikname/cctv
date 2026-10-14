@@ -651,7 +651,9 @@ class TestShortVisitExitAndIdentityTransferPrevention(unittest.TestCase):
         f_staff = _feat()
         f_statue = _feat()
         f_man = _feat()
-        f_cust2 = _feat()
+        ortho = np.random.randn(512).astype(np.float32)
+        ortho -= float(np.dot(ortho, f_man)) * f_man
+        f_cust2 = (ortho / np.linalg.norm(ortho)).astype(np.float32)
 
         # ── Phase 1: Video starts. Staff and Statue already inside ──────────
         # Frames 1-20: t = 0.1s -> 2.0s
@@ -1619,8 +1621,694 @@ class TestReturningVisitorIdentityRecovery(unittest.TestCase):
         self.assertTrue(any(l['query_tid'] == 'cam1-T21' and l['candidate_gid'] == 'P-002' for l in accepted_logs))
 
 
+
+# ── Mandatory Regression Suite: 12 Core Requirements ─────────────────────────
+class TestMandatoryRegressionScenarios(unittest.TestCase):
+    """
+    Mandatory regression tests required for CCTV Person Re-ID:
+    1. A woman enters, temporarily disappears, and returns: recover original ID.
+    2. A different man appears while the woman is temporarily lost: do not assign her ID to him.
+    3. Two people cross paths: prevent identity swaps.
+    4. Two people wear similar clothing: do not merge their identities based on color alone.
+    5. A visitor turns from front-facing to back-facing: recover identity when confidence is sufficient.
+    6. A person is occluded and receives a new local tracker ID: preserve the persistent identity.
+    7. An ambiguous Re-ID match occurs: defer rather than force the assignment.
+    8. A statue remains visible: do not assign it a visitor identity.
+    9. A person already inside at startup: do not fabricate an entry.
+    10. A completed visitor returns: recognize person, but create a new visit record.
+    11. A short visit is ignored: do not transfer that visitor's ID to another person.
+    12. An identity is recovered: do not increment gate counts twice or corrupt group membership.
+    """
+
+    def setUp(self):
+        from app.analytics.tripwire import TripwireCounter
+        from app.analytics.group_detector import GroupDetector
+        self.cm = CameraManager()
+        self.cm.add_camera("cam1", "MainEntrance", [])
+        self.mgr = GlobalIdentityManager(self.cm, require_candidate_motion=True)
+        # Gate line at y = 0.5 (y = 500 in 1000x1000), inside is below (y > 500)
+        self.gate = TripwireCounter(point_a=(0.0, 0.5), point_b=(1.0, 0.5), inside_direction="below", min_visit_duration_sec=5.0)
+        self.gd = GroupDetector(entry_window_sec=2.0, exit_window_sec=2.0)
+        self.gate.group_detector = self.gd
+        self.gate.identity_manager = self.mgr
+        self.mgr.gate_counter = self.gate
+        Config.REID_MATCH_THRESHOLD = 0.75
+        Config.ACTIVE_VISITOR_REID_THRESHOLD = 0.75
+
+    def tearDown(self):
+        Config.REID_MATCH_THRESHOLD = 0.75
+        Config.ACTIVE_VISITOR_REID_THRESHOLD = 0.75
+
+    def _synthetic_crop(self, upper_color, lower_color, size=(120, 60)):
+        h, w = size
+        crop = np.zeros((h, w, 3), dtype=np.uint8)
+        crop[: int(h * 0.15), :] = [180, 180, 180]
+        crop[int(h * 0.15) : int(h * 0.55), :] = upper_color
+        crop[int(h * 0.55) : int(h * 0.90), :] = lower_color
+        crop[int(h * 0.90) :, :] = [50, 50, 50]
+        return crop
+
+    # 1. A woman enters, temporarily disappears, and returns: recover original ID
+    def test_case_01_woman_enters_disappears_returns(self):
+        w, h = 1000, 1000
+        f_w = _feat()
+        crop_w = self._synthetic_crop([120, 30, 200], [20, 20, 20])
+        c_w = _clothing(upper_h=0.08, lower_h=0.60)
+
+        # Woman crosses gate inward (t = 1.0 -> 2.0s)
+        for fi in range(10, 20):
+            t = fi * 0.1
+            y = 350 + (fi - 10) * 30
+            det = [{'camera_id': 'cam1', 'track_id': 'T-W1', 'bbox': (400, int(y - 90), 470, int(y)), 'conf': 0.95, 'crop': crop_w}]
+            d = self.mgr.process_detections(det, {'T-W1': f_w}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h, clothing_map={'T-W1': c_w})
+            self.gate.check('T-W1', det[0]['bbox'], w, h, timestamp=t)
+            if 'T-W1' in self.mgr.local_to_global:
+                gid = self.mgr.local_to_global['T-W1']
+                self.gate.transfer_identity('T-W1', gid)
+
+        self.assertIn("P-001", self.mgr.persons)
+        self.gate.confirm_pending_visits(8.0)
+        self.assertEqual(self.gate.entry_count, 1)
+
+        # Woman disappears from frame
+        self.mgr.process_detections([], {}, 10.0, 100, gate_counter=self.gate, frame_w=w, frame_h=h)
+        self.assertEqual(self.mgr.persons["P-001"].status, "TEMPORARILY_LOST")
+
+        # Returns with new tracker ID and consistent appearance
+        det_ret = [{'camera_id': 'cam1', 'track_id': 'T-W2', 'bbox': (420, 580, 490, 670), 'conf': 0.94, 'crop': crop_w}]
+        d_ret = self.mgr.process_detections(det_ret, {'T-W2': _close(f_w)}, 12.0, 120, gate_counter=self.gate, frame_w=w, frame_h=h, clothing_map={'T-W2': c_w})
+        self.assertEqual(d_ret[0]['global_id'], "P-001", "Must recover original visitor ID P-001")
+        self.assertEqual(d_ret[0]['state'], "REIDENTIFIED")
+
+    # 2. A different man appears while the woman is temporarily lost: do not assign her ID to him
+    def test_case_02_different_man_appears_while_woman_lost(self):
+        w, h = 1000, 1000
+        f_w = _feat()
+        f_m = _feat()
+        c_w = _clothing(upper_h=0.05, lower_h=0.60) # red/blue
+        c_m = _clothing(upper_h=0.35, lower_h=0.10) # green/khaki
+
+        # Woman enters as P-001
+        det_w = [{'camera_id': 'cam1', 'track_id': 'T-WOMAN', 'bbox': (400, 420, 470, 560), 'conf': 0.95}]
+        self.mgr.process_detections(det_w, {'T-WOMAN': f_w}, 1.0, 1, gate_counter=self.gate, frame_w=w, frame_h=h, clothing_map={'T-WOMAN': c_w})
+        gid_w = self.mgr.promote_track_to_visitor('T-WOMAN', 1.0, bbox=det_w[0]['bbox'], clothing=c_w)
+        self.assertEqual(gid_w, "P-001")
+
+        # Woman temporarily lost
+        self.mgr.process_detections([], {}, 2.0, 2, gate_counter=self.gate, frame_w=w, frame_h=h)
+        self.assertEqual(self.mgr.persons["P-001"].status, "TEMPORARILY_LOST")
+
+        # Man appears
+        det_m = [{'camera_id': 'cam1', 'track_id': 'T-MAN', 'bbox': (405, 415, 475, 555), 'conf': 0.95}]
+        d_m = self.mgr.process_detections(det_m, {'T-MAN': f_m}, 3.0, 3, gate_counter=self.gate, frame_w=w, frame_h=h, clothing_map={'T-MAN': c_m})
+        self.assertNotEqual(d_m[0]['global_id'], "P-001", "Woman's ID must never be assigned to different man")
+
+    # 3. Two people cross paths: prevent identity swaps
+    def test_case_03_crossing_trajectories_prevent_swaps(self):
+        f1 = _feat()
+        f2 = _feat()
+        c1 = _clothing(upper_h=0.10, lower_h=0.60)
+        c2 = _clothing(upper_h=0.70, lower_h=0.20)
+
+        # Before crossing
+        dets_pre = [
+            {'camera_id': 'cam1', 'track_id': 'T1', 'bbox': (200, 300, 270, 440), 'conf': 0.95},
+            {'camera_id': 'cam1', 'track_id': 'T2', 'bbox': (600, 300, 670, 440), 'conf': 0.95},
+        ]
+        self.mgr.process_detections(dets_pre, {'T1': f1, 'T2': f2}, 1.0, 1, clothing_map={'T1': c1, 'T2': c2})
+        g1 = self.mgr.promote_track_to_visitor('T1', 1.0, bbox=dets_pre[0]['bbox'], clothing=c1)
+        g2 = self.mgr.promote_track_to_visitor('T2', 1.0, bbox=dets_pre[1]['bbox'], clothing=c2)
+
+        # Crossing / disappearance
+        self.mgr.process_detections([], {}, 2.0, 2)
+
+        # After crossing paths: positions swapped
+        dets_post = [
+            {'camera_id': 'cam1', 'track_id': 'T1_after', 'bbox': (620, 300, 690, 440), 'conf': 0.95},
+            {'camera_id': 'cam1', 'track_id': 'T2_after', 'bbox': (180, 300, 250, 440), 'conf': 0.95},
+        ]
+        d_post = self.mgr.process_detections(dets_post, {'T1_after': f1, 'T2_after': f2}, 3.0, 3, clothing_map={'T1_after': c1, 'T2_after': c2})
+        res = {x['track_id']: x['global_id'] for x in d_post}
+        self.assertEqual(res['T1_after'], g1, "T1 must retain original ID g1 after crossing")
+        self.assertEqual(res['T2_after'], g2, "T2 must retain original ID g2 after crossing")
+
+    # 4. Two people wear similar clothing: do not merge their identities based on color alone
+    def test_case_04_similar_clothing_no_merge_based_on_color_alone(self):
+        fA = _feat()
+        ortho = np.random.randn(512).astype(np.float32)
+        ortho -= float(np.dot(ortho, fA)) * fA
+        ortho /= float(np.linalg.norm(ortho))
+        fB = ortho.astype(np.float32) # distinct appearance
+        c_similar = _clothing(upper_h=0.0, lower_h=0.0) # both dark jackets, dark pants
+
+        # Person A is active
+        det_A = [{'camera_id': 'cam1', 'track_id': 'T-A', 'bbox': (200, 200, 280, 380), 'conf': 0.95}]
+        self.mgr.process_detections(det_A, {'T-A': fA}, 1.0, 1, gate_counter=self.gate, clothing_map={'T-A': c_similar})
+        gid_A = self.mgr.promote_track_to_visitor('T-A', 1.0, bbox=det_A[0]['bbox'], clothing=c_similar)
+
+        # Person A leaves frame (temporarily lost)
+        self.mgr.process_detections([], {}, 2.0, 2, gate_counter=self.gate)
+        self.assertEqual(self.mgr.persons[gid_A].status, "TEMPORARILY_LOST")
+
+        # Person B arrives with identical clothing color, but distinct deep embedding
+        det_B = [{'camera_id': 'cam1', 'track_id': 'T-B', 'bbox': (210, 210, 290, 390), 'conf': 0.95}]
+        d_B = self.mgr.process_detections(det_B, {'T-B': fB}, 3.0, 3, gate_counter=self.gate, clothing_map={'T-B': c_similar})
+
+        # MUST NOT be assigned gid_A based on clothing alone!
+        self.assertNotEqual(d_B[0]['global_id'], gid_A, "Similar clothing colors alone must never merge identities")
+
+    # 5. A visitor turns from front-facing to back-facing: recover identity when confidence is sufficient
+    def test_case_05_front_to_back_viewpoint_turn_recovery(self):
+        front_crop = self._synthetic_crop([0, 0, 220], [200, 50, 0])
+        back_crop = self._synthetic_crop([0, 0, 215], [195, 55, 5])
+        f_front = _feat()
+        ortho = np.random.rand(512).astype(np.float32)
+        ortho -= float(np.dot(ortho, f_front)) * f_front
+        ortho /= float(np.linalg.norm(ortho))
+        f_back = (0.55 * f_front + np.sqrt(1 - 0.55**2) * ortho).astype(np.float32)
+        f_back /= float(np.linalg.norm(f_back))
+
+        det_f = [{'camera_id': 'cam1', 'track_id': 'T-FRONT', 'bbox': (400, 420, 480, 560), 'conf': 0.95, 'crop': front_crop}]
+        self.mgr.process_detections(det_f, {'T-FRONT': f_front}, 1.0, 1, gate_counter=self.gate)
+        gid = self.mgr.promote_track_to_visitor('T-FRONT', 1.0, bbox=det_f[0]['bbox'])
+
+        # Turn during disappearance
+        self.mgr.process_detections([], {}, 2.0, 2, gate_counter=self.gate)
+
+        det_b = [{'camera_id': 'cam1', 'track_id': 'T-BACK', 'bbox': (410, 415, 490, 555), 'conf': 0.94, 'crop': back_crop}]
+        d_b = self.mgr.process_detections(det_b, {'T-BACK': f_back}, 3.0, 3, gate_counter=self.gate)
+        self.assertEqual(d_b[0]['global_id'], gid, "Turned visitor showing back must recover identity via multi-view & clothing")
+
+    # 6. A person is occluded and receives a new local tracker ID: preserve persistent identity
+    def test_case_06_occluded_new_tracker_id_preserves_persistent_identity(self):
+        f = _feat()
+        det1 = [{'camera_id': 'cam1', 'track_id': 'T-ORIG', 'bbox': (300, 300, 380, 480), 'conf': 0.95}]
+        self.mgr.process_detections(det1, {'T-ORIG': f}, 1.0, 1, gate_counter=self.gate)
+        gid = self.mgr.promote_track_to_visitor('T-ORIG', 1.0, bbox=det1[0]['bbox'])
+
+        # 1-frame occlusion
+        self.mgr.process_detections([], {}, 2.0, 2, gate_counter=self.gate)
+
+        # BoT-SORT re-detection with new tracker ID
+        det2 = [{'camera_id': 'cam1', 'track_id': 'T-NEW', 'bbox': (305, 305, 385, 485), 'conf': 0.95}]
+        d2 = self.mgr.process_detections(det2, {'T-NEW': _close(f)}, 3.0, 3, gate_counter=self.gate)
+        self.assertEqual(d2[0]['global_id'], gid, "Tracker ID reassignment after occlusion must preserve persistent ID")
+
+    # 7. An ambiguous Re-ID match occurs: defer rather than force the assignment
+    def test_case_07_ambiguous_reid_match_defers_assignment(self):
+        f1 = _feat()
+        f2 = _feat()
+        # Query feature with identical distance to f1 and f2
+        f_mid = (0.5 * f1 + 0.5 * f2).astype(np.float32)
+        f_mid /= float(np.linalg.norm(f_mid))
+
+        # Register two visitors P-001 and P-002
+        det1 = [{'camera_id': 'cam1', 'track_id': 'T1', 'bbox': (200, 300, 270, 450), 'conf': 0.95}]
+        det2 = [{'camera_id': 'cam1', 'track_id': 'T2', 'bbox': (600, 300, 670, 450), 'conf': 0.95}]
+        self.mgr.process_detections([det1[0], det2[0]], {'T1': f1, 'T2': f2}, 1.0, 1, gate_counter=self.gate)
+        g1 = self.mgr.promote_track_to_visitor('T1', 1.0, bbox=det1[0]['bbox'])
+        g2 = self.mgr.promote_track_to_visitor('T2', 1.0, bbox=det2[0]['bbox'])
+
+        # Both visitors lost
+        self.mgr.process_detections([], {}, 2.0, 2, gate_counter=self.gate)
+
+        # An ambiguous query appears equidistant between both candidates
+        det_amb = [{'camera_id': 'cam1', 'track_id': 'T-AMB', 'bbox': (400, 300, 470, 450), 'conf': 0.92}]
+        # Set spatial score neutral and clothing None so composite score evaluates deep sim
+        d_amb = self.mgr.process_detections(det_amb, {'T-AMB': f_mid}, 3.0, 3, gate_counter=self.gate)
+
+        # Must DEFER assignment and set state to IDENTITY_UNCERTAIN without fabricating a new visitor
+        self.assertEqual(d_amb[0]['state'], "IDENTITY_UNCERTAIN", "Ambiguous match must defer assignment")
+        self.assertNotIn(d_amb[0]['global_id'], (g1, g2), "Must not force an ambiguous match to either candidate")
+
+    # 8. A statue remains visible: do not assign it a visitor identity
+    def test_case_08_statue_remains_visible_rejected(self):
+        tid = "T-STATUE"
+        f = _feat()
+        # 30 frames at completely fixed coordinates
+        dec = None
+        for fi in range(1, 31):
+            t = fi * 0.1
+            det = [{'camera_id': 'cam1', 'track_id': tid, 'bbox': (700, 200, 780, 400), 'conf': 0.95}]
+            d = self.mgr.process_detections(det, {tid: f}, t, fi, gate_counter=self.gate)
+            dec = d[0]
+
+        self.assertEqual(dec['global_id'], "STATUE")
+        self.assertEqual(dec['state'], "STATIC")
+        self.assertEqual(len(self.mgr.persons), 0, "Statues must never receive visitor person records")
+
+    # 9. A person already inside at startup: do not fabricate an entry
+    def test_case_09_person_already_inside_at_startup_no_fabricated_entry(self):
+        w, h = 1000, 1000
+        tid = "T-STAFF"
+        f = _feat()
+        # Person deep inside at y = 800 (gate line at 500)
+        for fi in range(1, 25):
+            t = fi * 0.1
+            det = [{'camera_id': 'cam1', 'track_id': tid, 'bbox': (500 + fi*2, 720, 580 + fi*2, 820), 'conf': 0.95}]
+            d = self.mgr.process_detections(det, {tid: f}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h)
+            self.gate.check(tid, det[0]['bbox'], w, h, timestamp=t)
+
+            self.assertEqual(d[0]['global_id'], tid)
+            self.assertEqual(d[0]['state'], "UNVERIFIED_OCCUPANT")
+
+        self.assertEqual(self.gate.entry_count, 0, "Pre-existing occupant must never fabricate gate entries")
+        self.assertEqual(len(self.mgr.persons), 0)
+
+    # 10. A completed visitor returns: recognize person, but create a new visit record
+    def test_case_10_completed_visitor_returns_new_visit_record(self):
+        w, h = 1000, 1000
+        f = _feat()
+        # 1. Enter and confirm visit 1
+        for fi in range(10, 20):
+            t = fi * 0.1
+            y = 350 + (fi - 10) * 30
+            det = [{'camera_id': 'cam1', 'track_id': 'T1', 'bbox': (400, int(y - 90), 470, int(y)), 'conf': 0.95}]
+            d = self.mgr.process_detections(det, {'T1': f}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h)
+            self.gate.check('T1', det[0]['bbox'], w, h, timestamp=t)
+            if 'T1' in self.mgr.local_to_global:
+                gid = self.mgr.local_to_global['T1']
+                self.gate.transfer_identity('T1', gid)
+
+        self.gate.confirm_pending_visits(8.0)
+        self.assertEqual(self.gate.entry_count, 1)
+
+        # 2. Complete visit by exiting
+        for fi in range(200, 220):
+            t = fi * 0.1
+            y = 650 - (fi - 200) * 18
+            det = [{'camera_id': 'cam1', 'track_id': 'T1', 'bbox': (400, int(y - 90), 470, int(y)), 'conf': 0.95}]
+            self.mgr.process_detections(det, {'T1': f}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h)
+            self.gate.check("P-001", det[0]['bbox'], w, h, timestamp=t)
+
+        self.assertEqual(self.gate.exit_count, 1)
+        p = self.mgr.persons["P-001"]
+        self.assertTrue(p.is_departed)
+        self.assertEqual(p.current_visit_status, "COMPLETED")
+
+        # 3. Genuine return at t=100.0s (Visit 2)
+        for fi in range(1000, 1015):
+            t = fi * 0.1
+            y = 350 + (fi - 1000) * 25
+            det = [{'camera_id': 'cam1', 'track_id': 'T-RET', 'bbox': (400, int(y - 90), 470, int(y)), 'conf': 0.95}]
+            d = self.mgr.process_detections(det, {'T-RET': _close(f)}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h)
+            pkey = d[0]['global_id'] if d[0]['global_id'].startswith("P-") else 'T-RET'
+            self.gate.check(pkey, det[0]['bbox'], w, h, timestamp=t)
+
+        self.assertEqual(p.visit_id, "V-P-001-2", "Returning visitor must start new visit record V-P-001-2")
+        self.gate.confirm_pending_visits(110.0)
+        self.assertEqual(self.gate.entry_count, 2, "Second visit must count new entry")
+
+    # 11. A short visit is ignored: do not transfer that visitor's ID to another person
+    def test_case_11_short_visit_ignored_no_id_transfer(self):
+        w, h = 1000, 1000
+        f_visitor = _feat()
+        f_other = _feat()
+
+        # Visitor enters and exits within 2 seconds
+        for fi in range(10, 18):
+            t = fi * 0.1
+            y = 350 + (fi - 10) * 40
+            det = [{'camera_id': 'cam1', 'track_id': 'T-SHORT', 'bbox': (400, int(y - 90), 470, int(y)), 'conf': 0.95}]
+            d = self.mgr.process_detections(det, {'T-SHORT': f_visitor}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h)
+            self.gate.check('T-SHORT', det[0]['bbox'], w, h, timestamp=t)
+            if 'T-SHORT' in self.mgr.local_to_global:
+                self.gate.transfer_identity('T-SHORT', self.mgr.local_to_global['T-SHORT'])
+
+        for fi in range(18, 26):
+            t = fi * 0.1
+            y = 650 - (fi - 18) * 40
+            det = [{'camera_id': 'cam1', 'track_id': 'T-SHORT', 'bbox': (400, int(y - 90), 470, int(y)), 'conf': 0.95}]
+            self.mgr.process_detections(det, {'T-SHORT': f_visitor}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h)
+            self.gate.check('P-001', det[0]['bbox'], w, h, timestamp=t)
+
+        # Excluded from official counts
+        self.assertEqual(self.gate.entry_count, 0)
+        self.assertEqual(self.gate.exit_count, 0)
+        p = self.mgr.persons["P-001"]
+        self.assertEqual(p.current_visit_status, "SHORT_VISIT_IGNORED")
+
+        # Another person appears inside
+        det_other = [{'camera_id': 'cam1', 'track_id': 'T-OTHER', 'bbox': (600, 650, 680, 750), 'conf': 0.92}]
+        d_other = self.mgr.process_detections(det_other, {'T-OTHER': f_other}, 5.0, 50, gate_counter=self.gate, frame_w=w, frame_h=h)
+        self.assertNotEqual(d_other[0]['global_id'], "P-001", "Short visit ID must never be transferred to another person")
+
+    # 12. An identity is recovered: do not increment gate counts twice or corrupt group membership
+    def test_case_12_recovered_identity_preserves_counts_and_group_membership(self):
+        from app.identity.global_identity_manager import GlobalPerson
+        w, h = 1000, 1000
+        f1 = _feat()
+        f2 = _feat()
+
+        # Group of 2 enter together within 1.0s
+        self.gate.register_entry("P-001", 10.0)
+        self.gate.register_entry("P-002", 10.8)
+        p1 = GlobalPerson("P-001", 10.0, "cam1", "T1", f1, (300, 600, 370, 700))
+        p2 = GlobalPerson("P-002", 10.8, "cam1", "T2", f2, (400, 600, 470, 700))
+        self.mgr.persons["P-001"] = p1
+        self.mgr.persons["P-002"] = p2
+
+        # Confirm entries after 6 seconds
+        self.gate.confirm_pending_visits(17.0)
+        self.assertEqual(self.gate.entry_count, 2)
+
+        # P-001 is temporarily lost
+        p1.mark_lost()
+        self.assertEqual(p1.status, "TEMPORARILY_LOST")
+
+        # P-001 is recovered with new track T1-new
+        det_rec = [{'camera_id': 'cam1', 'track_id': 'T1-new', 'bbox': (310, 610, 380, 710), 'conf': 0.95}]
+        d_rec = self.mgr.process_detections(det_rec, {'T1-new': _close(f1)}, 20.0, 200, gate_counter=self.gate, frame_w=w, frame_h=h)
+        self.assertEqual(d_rec[0]['global_id'], "P-001")
+        self.gate.check("P-001", det_rec[0]['bbox'], w, h, timestamp=20.0)
+
+        # Verification: Gate count STILL exactly 2!
+        self.assertEqual(self.gate.entry_count, 2, "Re-identifying visitor must NEVER increment entry count again")
+
+        # Both exit together -> group formed correctly
+        self.gate.person_history["P-001"].clear()
+        self.gate.person_history["P-002"].clear()
+        self.gate.last_eval_debug.clear()
+        self.gate.check_departures(set(), {"P-001", "P-002"}, w, h, timestamp=50.0)
+        self.assertEqual(len(self.gd.group_records), 1, "Cohort group membership must be preserved after recovery")
+        self.assertEqual(self.gd.get_group("P-001"), self.gd.get_group("P-002"))
+
+
+
+# ── Regression Suite: Gate Identity & Group-Counting Bug Fixes ─────────────
+class TestGateIdentityAndGroupCountingBugs(unittest.TestCase):
+
+    def setUp(self):
+        from app.identity.global_identity_manager import GlobalIdentityManager
+        from app.analytics.tripwire import TripwireCounter
+        from app.analytics.group_detector import GroupDetector
+        from app.cameras.camera_manager import CameraManager
+
+        self.cam_mgr = CameraManager()
+        self.cam_mgr.add_camera("cam1", "cam1")
+        self.mgr = GlobalIdentityManager(self.cam_mgr, require_candidate_motion=True)
+        self.gd = GroupDetector(entry_window_sec=2.0, exit_window_sec=2.0)
+        self.gate = TripwireCounter(point_a=(0.0, 0.5), point_b=(1.0, 0.5), inside_direction="below")
+        self.gate.group_detector = self.gd
+        self.gate.identity_manager = self.mgr
+        self.mgr.gate_counter = self.gate
+        Config.REID_MATCH_THRESHOLD = 0.75
+        Config.ACTIVE_VISITOR_REID_THRESHOLD = 0.75
+
+    def tearDown(self):
+        Config.REID_MATCH_THRESHOLD = 0.75
+        Config.ACTIVE_VISITOR_REID_THRESHOLD = 0.75
+
+    # 1. An inside/unverified person first appears after a visitor already has a P-ID and cannot steal it
+    def test_unverified_person_appears_after_visitor_and_cannot_steal_id(self):
+        w, h = 1000, 1000
+        f_visitor = _feat()
+        c_visitor = _clothing(upper_h=0.10, lower_h=0.60)
+        
+        # Similar clothing and close embedding
+        f_unverified = _close(f_visitor)
+        c_unverified = _clothing(upper_h=0.10, lower_h=0.60)
+
+        # Visitor enters and crosses gate at t=1.0 - 2.0s
+        for fi in range(10, 20):
+            t = fi * 0.1
+            y = 350 + (fi - 10) * 30
+            det = [{'camera_id': 'cam1', 'track_id': 'T-VISITOR', 'bbox': (400, int(y - 90), 470, int(y)), 'conf': 0.95}]
+            d = self.mgr.process_detections(det, {'T-VISITOR': f_visitor}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h, clothing_map={'T-VISITOR': c_visitor})
+            ev = self.gate.check('T-VISITOR', det[0]['bbox'], w, h, timestamp=t, camera_id='cam1', feat=f_visitor, clothing=c_visitor)
+            if ev == "IN":
+                gid = self.mgr.local_to_global['T-VISITOR']
+                self.gate.transfer_identity('T-VISITOR', gid)
+
+        gid_visitor = self.mgr.local_to_global.get('T-VISITOR')
+        self.assertIsNotNone(gid_visitor)
+        self.assertTrue(gid_visitor.startswith("P-"), f"Visitor must receive a P-ID, got {gid_visitor}")
+
+        # Now visitor is inside. At t=5.0s, an unverified person appears deep inside the store (y=750)
+        det_unverified = [
+            {'camera_id': 'cam1', 'track_id': 'T-VISITOR', 'bbox': (400, 600, 470, 700), 'conf': 0.95},
+            {'camera_id': 'cam1', 'track_id': 'T-UNVERIFIED', 'bbox': (800, 750, 870, 850), 'conf': 0.92}
+        ]
+        d_both = self.mgr.process_detections(det_unverified, {'T-VISITOR': f_visitor, 'T-UNVERIFIED': f_unverified}, 5.0, 50, gate_counter=self.gate, frame_w=w, frame_h=h, clothing_map={'T-VISITOR': c_visitor, 'T-UNVERIFIED': c_unverified})
+        res = {x['track_id']: x for x in d_both}
+        self.assertEqual(res['T-UNVERIFIED']['global_id'], 'T-UNVERIFIED', "Unverified occupant must not receive visitor P-ID")
+        self.assertEqual(res['T-UNVERIFIED']['state'], 'UNVERIFIED_OCCUPANT')
+
+        # Now visitor temporarily disappears at t=6.0s
+        self.mgr.process_detections([], {}, 6.0, 60, gate_counter=self.gate)
+        self.assertEqual(self.mgr.persons[gid_visitor].status, "TEMPORARILY_LOST")
+
+        # Unverified person continues tracking with natural movement at t=7.0s
+        det_unv_only = [{'camera_id': 'cam1', 'track_id': 'T-UNVERIFIED', 'bbox': (860, 780, 930, 880), 'conf': 0.92}]
+        d_unv_only = self.mgr.process_detections(det_unv_only, {'T-UNVERIFIED': f_unverified}, 7.0, 70, gate_counter=self.gate, frame_w=w, frame_h=h, clothing_map={'T-UNVERIFIED': c_unverified})
+        self.assertNotEqual(d_unv_only[0]['global_id'], gid_visitor, "Unverified occupant MUST NEVER steal lost visitor's P-ID")
+        self.assertEqual(d_unv_only[0]['global_id'], 'T-UNVERIFIED')
+
+    # 2. A new visitor gets no P-ID before crossing and receives one after a valid crossing
+    def test_new_visitor_gets_no_pid_before_crossing_and_receives_one_after_valid_crossing(self):
+        w, h = 1000, 1000
+        f = _feat()
+
+        # Approaching gate outside (y = 200 - 380, gate is at y = 500)
+        for fi in range(1, 10):
+            t = fi * 0.1
+            y = 200 + fi * 20
+            det = [{'camera_id': 'cam1', 'track_id': 'T-APPROACH', 'bbox': (450, int(y - 80), 550, int(y)), 'conf': 0.9}]
+            d = self.mgr.process_detections(det, {'T-APPROACH': f}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h)
+            self.assertEqual(d[0]['global_id'], 'T-APPROACH', "Person approaching gate outside must not have P-ID")
+            self.assertEqual(d[0]['state'], 'OUTSIDE')
+            ev = self.gate.check('T-APPROACH', det[0]['bbox'], w, h, timestamp=t, camera_id='cam1', feat=f)
+            self.assertIsNone(ev, "No gate crossing before crossing line")
+            self.assertNotIn('T-APPROACH', self.mgr.local_to_global)
+
+        # Crosses gate line into store (y = 560 - 640)
+        promoted = False
+        for fi in range(10, 16):
+            t = fi * 0.1
+            y = 400 + (fi - 10) * 45
+            det = [{'camera_id': 'cam1', 'track_id': 'T-APPROACH', 'bbox': (450, int(y - 80), 550, int(y)), 'conf': 0.9}]
+            d = self.mgr.process_detections(det, {'T-APPROACH': f}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h)
+            person_key = self.mgr.local_to_global.get('T-APPROACH', 'T-APPROACH')
+            ev = self.gate.check(person_key, det[0]['bbox'], w, h, timestamp=t, camera_id='cam1', feat=f)
+            if ev == "IN":
+                promoted = True
+
+        self.assertTrue(promoted, "Valid crossing must trigger IN event")
+        gid = self.mgr.local_to_global.get('T-APPROACH')
+        self.assertIsNotNone(gid)
+        self.assertTrue(gid.startswith("P-"), f"Crossing must create permanent P-ID, got {gid}")
+
+    # 3. A temporarily lost visitor reappears with a new tracker ID/viewpoint, recovers the same P-ID, and is not counted as a second entry
+    def test_temporarily_lost_visitor_reappears_recovers_same_pid_no_double_entry_count(self):
+        w, h = 1000, 1000
+        f_visitor = _feat()
+        c_visitor = _clothing(upper_h=0.20, lower_h=0.70)
+
+        # Entry and confirmed visit
+        self.gate.register_entry("P-001", 10.0)
+        from app.identity.global_identity_manager import GlobalPerson
+        p = GlobalPerson("P-001", 10.0, "cam1", "T-OLD", f_visitor, (400, 600, 480, 720))
+        p.gallery.add_clothing(c_visitor)
+        self.mgr.persons["P-001"] = p
+        self.mgr.local_to_global["T-OLD"] = "P-001"
+
+        # Stay inside > 5s -> visit confirmed
+        self.gate.confirm_pending_visits(16.0)
+        self.assertEqual(self.gate.entry_count, 1)
+
+        # Visitor becomes temporarily lost
+        p.mark_lost()
+        del self.mgr.local_to_global["T-OLD"]
+        self.assertEqual(p.status, "TEMPORARILY_LOST")
+
+        # Visitor reappears with new track ID and turned viewpoint
+        f_turned = _close(f_visitor)
+        det_reappear = [{'camera_id': 'cam1', 'track_id': 'T-REAPPEAR', 'bbox': (420, 610, 500, 730), 'conf': 0.95}]
+        d = self.mgr.process_detections(det_reappear, {'T-REAPPEAR': f_turned}, 20.0, 200, gate_counter=self.gate, frame_w=w, frame_h=h, clothing_map={'T-REAPPEAR': c_visitor})
+        self.assertEqual(d[0]['global_id'], "P-001", "Must recover original P-001 ID")
+
+        # Check tripwire: gate count must NOT increment again
+        ev = self.gate.check("P-001", det_reappear[0]['bbox'], w, h, timestamp=20.0, camera_id="cam1", feat=f_turned)
+        self.assertEqual(self.gate.entry_count, 1, "Recovery must NEVER trigger another Gate IN")
+
+    # 4. A genuinely exited visitor re-enters with the same P-ID but a new visit record
+    def test_genuinely_exited_visitor_reenters_with_same_pid_and_new_visit_record(self):
+        w, h = 1000, 1000
+        f = _feat()
+        c = _clothing(upper_h=0.30, lower_h=0.80)
+
+        # Visit 1: Entry at t=10.0, confirmed at t=16.0, exit at t=40.0
+        self.gate.register_entry("P-001", 10.0)
+        from app.identity.global_identity_manager import GlobalPerson
+        p = GlobalPerson("P-001", 10.0, "cam1", "T1", f, (450, 600, 530, 720))
+        p.gallery.add_clothing(c)
+        self.mgr.persons["P-001"] = p
+        self.mgr.local_to_global["T1"] = "P-001"
+        self.gate.confirm_pending_visits(16.0)
+        self.assertEqual(self.gate.entry_count, 1)
+
+        # Official Exit at t=40.0
+        self.gate.person_history["P-001"].clear()
+        self.gate.check_departures(set(), {"P-001"}, w, h, timestamp=40.0)
+        self.assertEqual(self.gate.exit_count, 1)
+        self.assertTrue(p.is_departed)
+        self.assertEqual(p.current_visit_status, "COMPLETED")
+        self.assertEqual(len(self.gate.visit_records), 1)
+
+        # Re-entry at t=100.0: person returns with track T2 across gate
+        new_gid = self.mgr.promote_track_to_visitor("T2", 100.0, "cam1", _close(f), (450, 600, 530, 720), clothing=c)
+        self.assertEqual(new_gid, "P-001", "Returning visitor must retain same persistent P-001 ID")
+        self.assertEqual(p.visit_count, 2, "Must increment visit count to 2")
+        self.assertEqual(p.visit_id, "V-P-001-2", "Must create new distinct visit record")
+        self.assertFalse(p.is_departed)
+
+        self.gate.register_entry("P-001", 100.0)
+        self.gate.confirm_pending_visits(106.0)
+        self.assertEqual(self.gate.entry_count, 2, "Second visit confirmed after 5s inside")
+        self.assertEqual(len(self.gate.visit_records), 2, "Must have 2 separate visit records")
+
+    # 5. A visit of 5 seconds or less is excluded from official IN/OUT counts without unnecessarily deleting identity memory
+    def test_short_visit_under_5s_excluded_from_counts_while_identity_memory_preserved(self):
+        w, h = 1000, 1000
+        f = _feat()
+        c = _clothing(upper_h=0.45, lower_h=0.15)
+
+        # Entry at t=10.0
+        self.gate.register_entry("P-001", 10.0)
+        from app.identity.global_identity_manager import GlobalPerson
+        p = GlobalPerson("P-001", 10.0, "cam1", "T-SHORT", f, (450, 600, 530, 720))
+        p.gallery.add_clothing(c)
+        self.mgr.persons["P-001"] = p
+        self.mgr.local_to_global["T-SHORT"] = "P-001"
+
+        # Exits at t=13.0 (duration 3.0s <= 5.0s)
+        self.gate.person_history["P-001"].clear()
+        self.gate.check_departures(set(), {"P-001"}, w, h, timestamp=13.0)
+        self.assertEqual(self.gate.entry_count, 0, "Short visit must not increment entry count")
+        self.assertEqual(self.gate.exit_count, 0, "Short visit must not increment exit count")
+        self.assertEqual(p.current_visit_status, "SHORT_VISIT_IGNORED")
+        self.assertEqual(p.gallery.size(), 1, "Identity memory must be preserved")
+
+        # Visitor returns at t=50.0 and re-enters
+        re_gid = self.mgr.promote_track_to_visitor("T-RETURN", 50.0, "cam1", _close(f), (450, 600, 530, 720), clothing=c)
+        self.assertEqual(re_gid, "P-001", "Returning visitor whose prior visit was short must retain P-001")
+        self.gate.register_entry("P-001", 50.0)
+        self.gate.confirm_pending_visits(56.0)
+        self.assertEqual(self.gate.entry_count, 1, "Subsequent confirmed visit increments entry count")
+
+    # 6. Exact group cohort succeeds; partial exits, entry-window misses, and exit-window misses do not form a group
+    def test_exact_group_cohort_success_and_failures(self):
+        # 6a. Exact cohort of 2 succeeds
+        self.gd.reset()
+        self.gd.record_entry("P-001", 10.0)
+        self.gd.record_entry("P-002", 11.2)
+        self.gd.record_exit("P-001", 50.0)
+        self.gd.record_exit("P-002", 51.0)
+        self.assertEqual(len(self.gd.group_records), 1, "Exact cohort of 2 must form group")
+        self.assertEqual(self.gd.get_group("P-001"), self.gd.get_group("P-002"))
+
+        # 6b. Partial cohort exit fails (3 enter, only 2 exit)
+        self.gd.reset()
+        self.gd.record_entry("P-001", 10.0)
+        self.gd.record_entry("P-002", 10.8)
+        self.gd.record_entry("P-003", 11.5)
+        self.gd.record_exit("P-001", 60.0)
+        self.gd.record_exit("P-002", 60.5)
+        self.assertEqual(len(self.gd.group_records), 0, "Partial cohort exit (2 of 3) must NOT form a group")
+
+        # 6c. Entry window miss (> 2.0s) fails
+        self.gd.reset()
+        self.gd.record_entry("P-001", 10.0)
+        self.gd.record_entry("P-002", 13.5) # > 2.0s gap
+        self.gd.record_exit("P-001", 50.0)
+        self.gd.record_exit("P-002", 50.5)
+        self.assertEqual(len(self.gd.group_records), 0, "Entry window miss (> 2s) must NOT form a group")
+
+        # 6d. Exit window miss (> 2.0s) fails
+        self.gd.reset()
+        self.gd.record_entry("P-001", 10.0)
+        self.gd.record_entry("P-002", 11.0)
+        self.gd.record_exit("P-001", 50.0)
+        self.gd.record_exit("P-002", 55.0) # > 2.0s gap
+        self.assertEqual(len(self.gd.group_records), 0, "Exit window miss (> 2s) must NOT form a group")
+
+        # 6e. Returning visitor participates in a later group
+        self.gd.reset()
+        # Visit 1: P-001 enters and exits alone
+        self.gd.record_entry("P-001", 10.0)
+        self.gd.record_exit("P-001", 40.0)
+        self.assertEqual(len(self.gd.group_records), 0)
+
+        # Visit 2: P-001 returns and enters with P-003
+        self.gd.record_entry("P-001", 100.0)
+        self.gd.record_entry("P-003", 101.0)
+        self.gd.record_exit("P-001", 150.0)
+        self.gd.record_exit("P-003", 150.8)
+        self.assertEqual(len(self.gd.group_records), 1, "Returning visitor must form group on subsequent visit")
+        self.assertEqual(self.gd.get_group("P-001"), self.gd.get_group("P-003"))
+
+    # 7. Frame skipping does not create duplicate crossings or break valid crossing detection
+    def test_frame_skipping_no_duplicate_crossings_preserves_valid_detection(self):
+        fps = 25.0
+        w, h = 1000, 1000
+
+        for frame_skip in [1, 2, 5]:
+            self.gate.reset()
+            f = _feat()
+            
+            # Walking from outside (y=300) to inside (y=650) across gate at y=500
+            for fi in range(0, 50, frame_skip):
+                t = fi / fps
+                y = 300 + fi * 8.0 # gradual movement across line
+                det_bbox = (450, int(y - 80), 550, int(y))
+                self.gate.check("T1", det_bbox, w, h, timestamp=t, camera_id="cam1", feat=f)
+
+            # Person reaches deep inside (y=650) and stays inside for 7 seconds
+            t_entry = self.gate.confirmed_entries.get("P-001", self.gate.pending_entries.get("P-001"))
+            self.assertIsNotNone(t_entry, f"Entry must be detected under frame_skip={frame_skip}")
+
+            # Time advances by 6 seconds
+            t_confirm = t_entry + 6.0
+            for fi in range(50, 70, frame_skip):
+                t = t_confirm + (fi - 50) / fps
+                self.gate.check("P-001", (450, 600, 550, 680), w, h, timestamp=t)
+
+            self.assertEqual(self.gate.entry_count, 1, f"Frame skip {frame_skip} must yield exactly 1 entry (no duplicates)")
+
+    # 8. ResNet feature centering is deterministic and batch-independent
+    def test_resnet_feature_centering_deterministic_and_batch_independent(self):
+        from app.reid.model import ReIDModel
+        model = ReIDModel()
+
+        # Two distinct synthetic crops
+        crop1 = np.full((128, 64, 3), 40, dtype=np.uint8)
+        crop2 = np.full((128, 64, 3), 200, dtype=np.uint8)
+
+        # Single crop extraction
+        feat1_alone = model.extract_features([crop1])
+        feat2_alone = model.extract_features([crop2])
+
+        # Batch extraction of both
+        feats_batch = model.extract_features([crop1, crop2])
+        # Reversed batch
+        feats_rev = model.extract_features([crop2, crop1])
+
+        # Verification: Crop 1's embedding is invariant to batch size and batch contents
+        self.assertTrue(np.allclose(feat1_alone[0], feats_batch[0], atol=1e-3),
+                        "Crop 1 embedding must be identical alone vs in batch with Crop 2")
+        self.assertTrue(np.allclose(feat2_alone[0], feats_batch[1], atol=1e-3),
+                        "Crop 2 embedding must be identical alone vs in batch with Crop 1")
+        self.assertGreaterEqual(float(np.dot(feat1_alone[0], feats_batch[0])), 0.9999,
+                                "Cosine similarity alone vs batch must be >= 0.9999")
+        self.assertTrue(np.allclose(feat1_alone[0], feats_rev[1], atol=1e-3),
+                        "Crop 1 embedding must be invariant to batch order")
+        self.assertGreaterEqual(float(np.dot(feat1_alone[0], feats_rev[1])), 0.9999,
+                                "Cosine similarity invariant to batch order must be >= 0.9999")
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
 
 
 

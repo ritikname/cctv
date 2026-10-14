@@ -111,14 +111,10 @@ class ReIDModel:
         with torch.no_grad():
             cnn_feats = self.model(batch).cpu().numpy()  # raw, un-normalised
 
-        # Whiten: subtract per-dimension mean across batch so features are
-        # zero-centred. For a single crop, we subtract the feature's own mean.
-        if cnn_feats.shape[0] > 1:
-            # Batch whitening: subtract batch mean per dimension
-            cnn_feats = cnn_feats - cnn_feats.mean(axis=0, keepdims=True)
-        else:
-            # Single-sample: subtract the feature vector's own mean
-            cnn_feats = cnn_feats - cnn_feats.mean(axis=1, keepdims=True)
+        # Deterministic per-sample zero-centering (instance normalization across feature dimensions):
+        # A crop's embedding must be completely deterministic and independent of which other crops
+        # happen to be in the same inference batch or their order.
+        cnn_feats = cnn_feats - cnn_feats.mean(axis=1, keepdims=True)
 
         # L2 normalise after whitening
         norms = np.linalg.norm(cnn_feats, axis=1, keepdims=True)
