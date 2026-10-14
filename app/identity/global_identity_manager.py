@@ -815,9 +815,19 @@ class GlobalIdentityManager:
                         app_score = deep_sim
 
                     tp_score = _temporal_score(time_gap)
-                    composite = (self.W_APPEARANCE * app_score
-                                 + self.W_SPATIAL * sp_score
-                                 + self.W_TEMPORAL * tp_score)
+                    # Adaptive weighting based on elapsed time:
+                    # When freshly lost (<= 2s), spatial continuity is critical.
+                    # When lost for several seconds (>= 5s), appearance/clothing is the primary signal.
+                    if time_gap < 2.0:
+                        w_app, w_sp, w_tp = 0.45, 0.35, 0.20
+                    elif time_gap < 5.0:
+                        w_app, w_sp, w_tp = 0.55, 0.25, 0.20
+                    else:
+                        w_app, w_sp, w_tp = 0.65, 0.15, 0.20
+
+                    composite = (w_app * app_score
+                                 + w_sp * sp_score
+                                 + w_tp * tp_score)
 
                     cands_for_q.append({
                         "gid": gid,
@@ -946,22 +956,38 @@ class GlobalIdentityManager:
 
                 # Threshold check
                 if top["composite"] < min_c or top["app_score"] < min_a:
-                    self.reid_log.append({
-                        "frame": frame_idx, "ts": round(timestamp, 3),
-                        "camera_id": cam_id, "query_tid": tid, "assigned_gid": None,
-                        "candidate_gid": gid,
-                        "candidate_gids": evaluated_gids, "best_candidate": gid,
-                        "second_candidate": second["gid"] if second else None,
-                        "deep_sim": round(top["deep_sim"], 4), "cloth_sim": round(top["cloth_sim"], 4) if top["cloth_sim"] is not None else None,
-                        "app_score": round(top["app_score"], 4), "sp_score": round(top["sp_score"], 4),
-                        "tp_score": round(top["tp_score"], 4), "composite": round(comp, 4),
-                        "margin": round(margin, 4),
-                        "decision": "REJECTED_THRESHOLD",
-                        "reason": f"Composite {comp:.3f} < {min_c} or app_score {top['app_score']:.3f} < {min_a}",
-                        "allow_gallery_update": False,
-                        "min_composite": min_c, "min_app": min_a,
-                    })
-                    continue
+                    vlm_corroborated = False
+                    if getattr(self, "vlm_verifier", None) is not None and self.vlm_verifier.enabled:
+                        det = unknown_dets[q_idx]
+                        query_crop = det.get('crop')
+                        amb_low = getattr(Config, "VLM_AMBIGUITY_LOW", 0.68)
+                        amb_high = getattr(Config, "VLM_AMBIGUITY_HIGH", 0.78)
+                        # When candidate appearance is in ambiguity range and no other close competitor
+                        if query_crop is not None and (amb_low <= top["app_score"] <= amb_high) and (second is None or margin >= 0.06):
+                            vlm_res = self.vlm_verifier.verify_candidate(query_crop, gid)
+                            if vlm_res.get("match") and vlm_res.get("confidence", 0.0) >= 0.75:
+                                top["app_score"] = max(top["app_score"], 0.82)
+                                top["composite"] = max(top["composite"], min_c + 0.05)
+                                comp = top["composite"]
+                                vlm_corroborated = True
+
+                    if not vlm_corroborated:
+                        self.reid_log.append({
+                            "frame": frame_idx, "ts": round(timestamp, 3),
+                            "camera_id": cam_id, "query_tid": tid, "assigned_gid": None,
+                            "candidate_gid": gid,
+                            "candidate_gids": evaluated_gids, "best_candidate": gid,
+                            "second_candidate": second["gid"] if second else None,
+                            "deep_sim": round(top["deep_sim"], 4), "cloth_sim": round(top["cloth_sim"], 4) if top["cloth_sim"] is not None else None,
+                            "app_score": round(top["app_score"], 4), "sp_score": round(top["sp_score"], 4),
+                            "tp_score": round(top["tp_score"], 4), "composite": round(comp, 4),
+                            "margin": round(margin, 4),
+                            "decision": "REJECTED_THRESHOLD",
+                            "reason": f"Composite {comp:.3f} < {min_c} or app_score {top['app_score']:.3f} < {min_a}",
+                            "allow_gallery_update": False,
+                            "min_composite": min_c, "min_app": min_a,
+                        })
+                        continue
 
                 # ACCEPT MATCH
                 p = self.persons[gid]

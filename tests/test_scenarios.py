@@ -2601,6 +2601,127 @@ class TestRobustIdentityAndVLMRegression(unittest.TestCase):
         self.assertEqual(d_res[0]['global_id'], "P-001", "VLM should resolve tie to P-001")
         self.assertEqual(d_res[0]['state'], "REIDENTIFIED")
 
+    # 8. VLM corroborates near-threshold match in ambiguity band
+    def test_vlm_corroborates_near_threshold_match(self):
+        from app.reid.vlm_verifier import VLMVerifier
+        from unittest.mock import MagicMock
+
+        w, h = 1000, 1000
+        fA = _feat()
+
+        # P-001 enters
+        for fi in range(10, 20):
+            t = fi * 0.1
+            y = 350 + (fi - 10) * 30
+            det = [{'camera_id': 'cam1', 'track_id': 'T-1', 'bbox': (300, int(y - 90), 370, int(y)), 'conf': 0.95}]
+            self.mgr.process_detections(det, {'T-1': fA}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h)
+            ev = self.gate.check('T-1', det[0]['bbox'], w, h, timestamp=t, camera_id='cam1', feat=fA)
+            if ev == "IN":
+                self.gate.transfer_identity('T-1', self.mgr.local_to_global['T-1'])
+
+        gid1 = self.mgr.local_to_global['T-1']
+        self.assertEqual(gid1, "P-001")
+
+        # P-001 becomes temporarily lost
+        self.mgr.process_detections([], {}, 3.0, 30, gate_counter=self.gate)
+        self.assertEqual(self.mgr.persons[gid1].status, "TEMPORARILY_LOST")
+
+        # Mock VLM enabled: confirms match with 0.88 confidence
+        mock_vlm = VLMVerifier(enabled=True)
+        mock_vlm.verify_candidate = MagicMock(return_value={
+            "match": True, "confidence": 0.88, "reason": "Consistent jacket and hairstyle", "status": "SUCCESS"
+        })
+        self.mgr.set_vlm_verifier(mock_vlm)
+
+        # Candidate returns with appearance similarity = 0.72 (perturbed feature: within [0.68, 0.78])
+        f_cand = _perturb(fA, noise_level=0.28)  # target_sim ~ 0.72
+        fake_crop = np.zeros((100, 50, 3), dtype=np.uint8)
+        det_cand = [{'camera_id': 'cam1', 'track_id': 'T-RET', 'bbox': (310, 550, 380, 650), 'conf': 0.95, 'crop': fake_crop}]
+
+        d_res = self.mgr.process_detections(
+            det_cand, {'T-RET': f_cand}, 4.0, 40,
+            gate_counter=self.gate, frame_w=w, frame_h=h
+        )
+
+        # Verification: VLM corroboration allows candidate to be re-identified as P-001
+        self.assertEqual(len(d_res), 1)
+        self.assertEqual(d_res[0]['global_id'], "P-001", "VLM must corroborate near-threshold match to P-001")
+        self.assertEqual(d_res[0]['state'], "REIDENTIFIED")
+
+    # 9. Doorway threshold entry crossing
+    def test_doorway_threshold_crossing_entry(self):
+        w, h = 1000, 1000
+        # Gate line at y = 500 (point_a=(0.2, 0.5), point_b=(0.8, 0.5), inside_direction="below")
+        # Inward traversal is y increasing (dist goes from positive to negative)
+        # Track appears at y = 530 (dist ~ -30px, within threshold corridor)
+        f_lady = _feat()
+        det0 = [{'camera_id': 'cam1', 'track_id': 'T-LADY', 'bbox': (450, 430, 520, 530), 'conf': 0.95}]
+        self.mgr.process_detections(det0, {'T-LADY': f_lady}, 1.0, 10, gate_counter=self.gate, frame_w=w, frame_h=h)
+        ev0 = self.gate.check('T-LADY', det0[0]['bbox'], w, h, timestamp=1.0, camera_id='cam1', feat=f_lady)
+        self.assertIsNone(ev0, "First frame in threshold should initialize state, not trigger immediately")
+
+        # Inward travel to y = 620 (dist ~ -120px)
+        det1 = [{'camera_id': 'cam1', 'track_id': 'T-LADY', 'bbox': (450, 520, 520, 620), 'conf': 0.95}]
+        self.mgr.process_detections(det1, {'T-LADY': f_lady}, 2.0, 20, gate_counter=self.gate, frame_w=w, frame_h=h)
+        ev1 = self.gate.check('T-LADY', det1[0]['bbox'], w, h, timestamp=2.0, camera_id='cam1', feat=f_lady)
+
+        self.assertEqual(ev1, "IN", "Valid inward traversal from threshold zone must trigger IN crossing")
+        gid = self.mgr.local_to_global['T-LADY']
+        self.assertTrue(gid.startswith("P-"), "Track must be promoted to permanent visitor")
+
+    # 10. Visitor doorway departure and subsequent re-entry retention
+    def test_visitor_departure_and_reentry(self):
+        w, h = 1000, 1000
+        f_vis = _feat()
+        self.gate.identity_manager = self.mgr
+        self.mgr.gate_counter = self.gate
+
+        # 1. Visitor enters
+        for fi in range(10, 20):
+            t = fi * 0.1
+            y = 350 + (fi - 10) * 30
+            det = [{'camera_id': 'cam1', 'track_id': 'T-1', 'bbox': (300, int(y - 90), 370, int(y)), 'conf': 0.95}]
+            self.mgr.process_detections(det, {'T-1': f_vis}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h)
+            ev = self.gate.check('T-1', det[0]['bbox'], w, h, timestamp=t, camera_id='cam1', feat=f_vis)
+            if ev == "IN":
+                self.gate.transfer_identity('T-1', self.mgr.local_to_global['T-1'])
+
+        gid = self.mgr.local_to_global['T-1']
+        self.assertEqual(gid, "P-001")
+
+        # Stay inside for 6s so visit is confirmed
+        self.gate.confirm_pending_visits(8.0)
+        self.assertEqual(self.gate.entry_count, 1)
+
+        # 2. Visitor walks towards door (foot y moves from 700 to 520, near gate at y=500)
+        # and then disappears
+        for fi in range(25, 30):
+            t = 8.0 + (fi - 25) * 0.2
+            y = 650 - (fi - 25) * 25  # moving towards door
+            self.gate.check(gid, (300, int(y - 90), 370, int(y)), w, h, timestamp=t, camera_id='cam1')
+
+        # Visitor is now lost from camera view
+        dep_events = self.gate.check_departures(set(), {gid}, w, h, timestamp=10.0)
+        self.assertEqual(len(dep_events), 1, "Doorway departure must register OUT event")
+        self.assertEqual(dep_events[0][0], "OUT")
+        self.assertEqual(self.gate.exit_count, 1)
+        self.assertTrue(self.mgr.persons[gid].is_departed, "Person must be marked departed in identity manager")
+
+        # 3. Visitor returns later (re-enters at t = 20.0 with new tracker ID T-RETURN)
+        for fi in range(40, 50):
+            t = 20.0 + (fi - 40) * 0.2
+            y = 400 + (fi - 40) * 25  # crossing inward past gate
+            det_ret = [{'camera_id': 'cam1', 'track_id': 'T-RETURN', 'bbox': (300, int(y - 90), 370, int(y)), 'conf': 0.95}]
+            self.mgr.process_detections(det_ret, {'T-RETURN': f_vis}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h)
+            ev_ret = self.gate.check('T-RETURN', det_ret[0]['bbox'], w, h, timestamp=t, camera_id='cam1', feat=f_vis)
+            if ev_ret == "IN":
+                self.gate.transfer_identity('T-RETURN', self.mgr.local_to_global['T-RETURN'])
+
+        # Verification: retained same P-001 identity on re-entry!
+        ret_gid = self.mgr.local_to_global['T-RETURN']
+        self.assertEqual(ret_gid, "P-001", "Returning visitor must retain persistent ID P-001")
+        self.assertEqual(self.mgr.persons['P-001'].visit_count, 2, "Must start distinct 2nd visit record")
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

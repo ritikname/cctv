@@ -38,7 +38,7 @@ class Config:
     VISITOR_RETENTION_TIME      = 3600      # seconds (1 hour) – retain departed visitor gallery for re-entry recognition
 
     # ─── Local VLM Verifier (Ollama) ──────────────────────────────────────────
-    VLM_ENABLED                 = False
+    VLM_ENABLED                 = True
     VLM_BASE_URL                = "http://localhost:11434"
     VLM_MODEL                   = "qwen3.5:2b-q4_K_M"
     VLM_TIMEOUT                 = 3.0

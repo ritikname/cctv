@@ -365,6 +365,7 @@ class TripwireCounter:
         corr_exit = max(15.0, frame_h * 0.02)   # Natural threshold across doorway onto street
         min_travel = max(self.min_crossing_travel_px * 0.65, frame_h * 0.03)
         min_exit_depth = max(self.min_in_store_depth_for_exit_px, frame_h * 0.10)
+        entrance_threshold_zone = max(self.corridor_half_width_px * 2.5, 75.0, frame_h * 0.08)
 
         curr_state = self.person_state.get(person_id)
 
@@ -373,12 +374,14 @@ class TripwireCounter:
             if dist >= 0.0:
                 self.person_state[person_id] = "OUTSIDE"
                 init_reason = "INIT_OUTSIDE"
-            elif dist < -corr_entry * 1.5:
-                self.person_state[person_id] = "INSIDE"
-                init_reason = "INIT_INSIDE_PREEXISTING"
-            else:
+            elif dist >= -entrance_threshold_zone:
+                # Within the entrance doorway threshold corridor
                 self.person_state[person_id] = "THRESHOLD"
                 init_reason = "INIT_THRESHOLD"
+            else:
+                # Genuinely deep inside the store before tracking began
+                self.person_state[person_id] = "INSIDE"
+                init_reason = "INIT_INSIDE_PREEXISTING"
 
             self._record_eval(person_id, (foot_x, foot_y), dist, None, self.person_state[person_id], 0.0, t, is_within_span, timestamp, None, init_reason)
             return None
@@ -418,7 +421,7 @@ class TripwireCounter:
                 travel = max_past_dist - dist
 
                 # Must have originated from outside or threshold and traveled inward across gate
-                originated_outside = (max_past_dist >= -corr_entry * 0.5)
+                originated_outside = (max_past_dist >= -max(corr_entry * 0.8, entrance_threshold_zone * 0.85))
 
                 if originated_outside and travel >= min_travel and time_since_last_cross >= 1.0:
                     self.person_state[person_id] = "INSIDE"
@@ -522,11 +525,14 @@ class TripwireCounter:
                 hist = self.person_history.get(pid)
                 if hist and len(hist) >= 3:
                     lx, ly, ldist = hist[-1]
-                    first_dists = [h[2] for h in list(hist)[-15:]]
-                    heading_to_door = (first_dists[-1] > first_dists[0] + 15.0)
-                    has_been_deep = (self.deepest_inside.get(pid, 0.0) <= -frame_h * 0.10)
-                    # Only complete visit if the tracked foot trajectory actually reached the exit threshold
-                    should_depart = (has_been_deep and heading_to_door and ldist >= 0.0)
+                    recent_k = min(len(hist), 5)
+                    recent_dists = [h[2] for h in list(hist)[-recent_k:]]
+                    heading_to_door = (recent_dists[-1] > recent_dists[0] + 6.0)
+                    min_exit_depth = max(self.min_in_store_depth_for_exit_px, frame_h * 0.10)
+                    has_been_deep = (self.deepest_inside.get(pid, 0.0) <= -min_exit_depth)
+                    door_exit_thresh = max(self.corridor_half_width_px * 2.5, 75.0, frame_h * 0.08)
+                    # Complete visit if tracked trajectory was moving toward door and reached doorway threshold corridor
+                    should_depart = (has_been_deep and heading_to_door and ldist >= -door_exit_thresh)
                 elif not hist and pid not in self.last_eval_debug:
                     # Direct test harness invocation without trajectory history
                     lx, ly = (0.0, 0.0)

@@ -52,6 +52,10 @@ class VideoProcessorThread(QObject):
     def update_roi(self, l, t, r, b):
         self.roi_norm = (l, t, r, b)
 
+    def set_vlm_enabled(self, enabled):
+        if getattr(self, "vlm_verifier", None):
+            self.vlm_verifier.enabled = enabled
+
     def run(self):
         self.processor = MultiCameraProcessor()
         for cam_id, path in self.cameras:
@@ -61,13 +65,15 @@ class VideoProcessorThread(QObject):
         p1, p2 = self.gate_norm
         self.tripwire = TripwireCounter(point_a=p1, point_b=p2, inside_direction=self.gate_dir)
         self.tripwire.group_detector = self.processor.group_detector
+        self.tripwire.identity_manager = self.processor.identity_manager
+        self.processor.identity_manager.gate_counter = self.tripwire
 
         # Local VLM Verifier (Ollama)
         from app.reid.vlm_verifier import VLMVerifier
         self.vlm_verifier = VLMVerifier(
             base_url=getattr(Config, "VLM_BASE_URL", "http://localhost:11434"),
             model=getattr(Config, "VLM_MODEL", "qwen3.5:2b-q4_K_M"),
-            enabled=getattr(Config, "VLM_ENABLED", False),
+            enabled=getattr(Config, "VLM_ENABLED", True),
             timeout=getattr(Config, "VLM_TIMEOUT", 3.0),
         )
         self.processor.identity_manager.set_vlm_verifier(self.vlm_verifier)
@@ -194,12 +200,19 @@ class VideoProcessorThread(QObject):
                         dec['global_id'] = current_gid
                         if event == "IN":
                             dec['state'] = "NEW"
-                            if det.get('crop') is not None and getattr(self, "vlm_verifier", None):
-                                self.vlm_verifier.store_reference_crop(current_gid, det['crop'])
+                        if det.get('crop') is not None and getattr(self, "vlm_verifier", None) and self.vlm_verifier.enabled:
+                            ref_crops = self.vlm_verifier.reference_crops.get(current_gid, [])
+                            if len(ref_crops) < 3:
+                                bw = det['bbox'][2] - det['bbox'][0]
+                                bh = det['bbox'][3] - det['bbox'][1]
+                                if bw >= 20 and bh >= 45:
+                                    self.vlm_verifier.store_reference_crop(current_gid, det['crop'])
 
                 # Check doorway departures among registered people who were inside and departed through the door
                 lost_gids = set(id_mgr.persons.keys()) - active_gids
-                self.tripwire.check_departures(active_gids, lost_gids, frame_w, frame_h, timestamp=timestamp)
+                departures = self.tripwire.check_departures(active_gids, lost_gids, frame_w, frame_h, timestamp=timestamp)
+                for ev, pid, ts in departures:
+                    id_mgr.terminate_visit(pid, ts, is_short=False)
 
                 # ── 3.5 Group Detection (only for moving, active people) ───
                 active_persons = []
@@ -243,7 +256,8 @@ class VideoProcessorThread(QObject):
                     if not (gid and gid.startswith("P-")):
                         x1, y1, x2, y2 = det['bbox']
                         fx, fy = int((x1 + x2) / 2.0), int(y2)
-                        dbg_info = self.tripwire.last_eval_debug.get(person_key) or self.tripwire.last_eval_debug.get(tid)
+                        p_key = gid if (gid and gid.startswith("P-")) else tid
+                        dbg_info = self.tripwire.last_eval_debug.get(p_key) or self.tripwire.last_eval_debug.get(tid)
                         d_val = dbg_info.get('dist', 0.0) if dbg_info else 0.0
                         st_val = (dbg_info.get('new_state') or state) if dbg_info else state
                         dbg_txt = f"{st_val} d:{d_val:+.0f}px"
@@ -475,7 +489,13 @@ class MainWindow(QMainWindow):
         self.spin_active_reid_thresh.valueChanged.connect(self.on_active_reid_threshold_changed)
         active_reid_row.addWidget(lbl_active_reid)
         active_reid_row.addWidget(self.spin_active_reid_thresh)
-        ctrl_layout.addLayout(active_reid_row)
+        # Local VLM Verifier (Ollama)
+        self.chk_vlm = QCheckBox("Enable Local VLM Verifier (Ollama Qwen 3.5)")
+        self.chk_vlm.setChecked(getattr(Config, "VLM_ENABLED", True))
+        self.chk_vlm.setStyleSheet("font-size: 12px; color: #00e5ff; font-weight: bold; margin-top: 4px;")
+        self.chk_vlm.setToolTip("Uses local Ollama Qwen 3.5 vision model to verify ambiguous person re-identifications.")
+        self.chk_vlm.toggled.connect(self.on_vlm_toggled)
+        ctrl_layout.addWidget(self.chk_vlm)
 
         left.addWidget(ctrl_box)
 
@@ -584,6 +604,11 @@ class MainWindow(QMainWindow):
 
     def on_active_reid_threshold_changed(self, val):
         Config.ACTIVE_VISITOR_REID_THRESHOLD = val / 100.0
+
+    def on_vlm_toggled(self, checked):
+        Config.VLM_ENABLED = checked
+        if self.processor_thread:
+            self.processor_thread.set_vlm_enabled(checked)
 
     def add_video(self):
         path, _ = QFileDialog.getOpenFileName(
