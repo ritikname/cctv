@@ -191,7 +191,8 @@ class VideoProcessorThread(QObject):
                     event = self.tripwire.check(
                         person_key, det['bbox'], frame_w, frame_h,
                         is_static=is_static_person, timestamp=timestamp,
-                        camera_id=cam_id, feat=features_map.get(tid)
+                        camera_id=cam_id, feat=features_map.get(tid),
+                        crop=det.get('crop')
                     )
                     # Sync promoted or active persistent ID
                     current_gid = id_mgr.local_to_global.get(tid, gid)

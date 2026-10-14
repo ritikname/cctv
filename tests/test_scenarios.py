@@ -2722,6 +2722,108 @@ class TestRobustIdentityAndVLMRegression(unittest.TestCase):
         self.assertEqual(ret_gid, "P-001", "Returning visitor must retain persistent ID P-001")
         self.assertEqual(self.mgr.persons['P-001'].visit_count, 2, "Must start distinct 2nd visit record")
 
+    # 11. Cross-camera unverified track rejected when cameras are disconnected
+    def test_unverified_cross_camera_disconnected_rejected(self):
+        w, h = 1000, 1000
+        f_vis = _feat()
+        c_vis = _clothing(upper_h=0.10, lower_h=0.50)
+
+        # Entrance on cam1
+        for fi in range(10, 20):
+            t = fi * 0.1
+            y = 350 + (fi - 10) * 30
+            det = [{'camera_id': 'cam1', 'track_id': 'T-ENT', 'bbox': (300, int(y - 90), 370, int(y)), 'conf': 0.95}]
+            self.mgr.process_detections(det, {'T-ENT': f_vis}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h, clothing_map={'T-ENT': c_vis})
+            ev = self.gate.check('T-ENT', det[0]['bbox'], w, h, timestamp=t, camera_id='cam1', feat=f_vis)
+            if ev == "IN":
+                self.gate.transfer_identity('T-ENT', self.mgr.local_to_global['T-ENT'])
+
+        self.assertIn("P-001", self.mgr.persons)
+        self.gate.confirm_pending_visits(8.0)
+
+        # Visitor is lost
+        self.mgr.process_detections([], {}, 10.0, 100, gate_counter=self.gate, frame_w=w, frame_h=h)
+        self.assertEqual(self.mgr.persons["P-001"].status, "TEMPORARILY_LOST")
+
+        # Disconnected camera manager
+        cm = CameraManager()
+        cm.add_camera("cam1", "Entrance", [])
+        cm.add_camera("cam2", "Isolated", [])
+        self.mgr.camera_manager = cm
+
+        # Candidate appears on cam2 with matching appearance
+        det_cam2 = [{'camera_id': 'cam2', 'track_id': 'T-CAM2', 'bbox': (400, 400, 470, 500), 'conf': 0.95}]
+        d_res = self.mgr.process_detections(det_cam2, {'T-CAM2': _close(f_vis)}, 12.0, 120, gate_counter=self.gate, frame_w=w, frame_h=h, clothing_map={'T-CAM2': c_vis})
+
+        # Must NOT inherit P-001 from cam1
+        self.assertEqual(d_res[0]['global_id'], 'T-CAM2')
+        self.assertNotIn('T-CAM2', self.mgr.local_to_global)
+
+    # 12. In-store recovery never contaminates visitor gallery
+    def test_in_store_recovery_never_contaminates_gallery(self):
+        w, h = 1000, 1000
+        f_vis = _feat()
+        c_vis = _clothing(upper_h=0.10, lower_h=0.50)
+
+        for fi in range(10, 20):
+            t = fi * 0.1
+            y = 350 + (fi - 10) * 30
+            det = [{'camera_id': 'cam1', 'track_id': 'T-ENT', 'bbox': (300, int(y - 90), 370, int(y)), 'conf': 0.95}]
+            self.mgr.process_detections(det, {'T-ENT': f_vis}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h, clothing_map={'T-ENT': c_vis})
+            ev = self.gate.check('T-ENT', det[0]['bbox'], w, h, timestamp=t, camera_id='cam1', feat=f_vis)
+            if ev == "IN":
+                self.gate.transfer_identity('T-ENT', self.mgr.local_to_global['T-ENT'])
+
+        orig_gallery_size = self.mgr.persons["P-001"].gallery.size()
+        last_bbox = self.mgr.persons["P-001"].last_bbox
+
+        # Temporarily lost
+        self.mgr.process_detections([], {}, 5.0, 50, gate_counter=self.gate, frame_w=w, frame_h=h)
+        self.assertEqual(self.mgr.persons["P-001"].status, "TEMPORARILY_LOST")
+
+        # Recover nearby
+        det_rec = [{'camera_id': 'cam1', 'track_id': 'T-REC', 'bbox': (last_bbox[0] + 15, last_bbox[1] + 15, last_bbox[2] + 15, last_bbox[3] + 15), 'conf': 0.95}]
+        d_res = self.mgr.process_detections(det_rec, {'T-REC': _close(f_vis)}, 6.0, 60, gate_counter=self.gate, frame_w=w, frame_h=h, clothing_map={'T-REC': c_vis})
+
+        # Identity recovered
+        self.assertEqual(d_res[0]['global_id'], "P-001")
+        # But gallery size must NOT have increased from unverified in-store recovery!
+        self.assertEqual(self.mgr.persons["P-001"].gallery.size(), orig_gallery_size)
+
+    # 13. Temporarily lost visitor re-entering through gate recovers same P-ID
+    def test_temporarily_lost_visitor_reentry_gate_crossing_recovers_same_pid(self):
+        w, h = 1000, 1000
+        f_vis = _feat()
+        c_vis = _clothing(upper_h=0.10, lower_h=0.50)
+
+        for fi in range(10, 20):
+            t = fi * 0.1
+            y = 350 + (fi - 10) * 30
+            det = [{'camera_id': 'cam1', 'track_id': 'T-ENT', 'bbox': (300, int(y - 90), 370, int(y)), 'conf': 0.95}]
+            self.mgr.process_detections(det, {'T-ENT': f_vis}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h, clothing_map={'T-ENT': c_vis})
+            ev = self.gate.check('T-ENT', det[0]['bbox'], w, h, timestamp=t, camera_id='cam1', feat=f_vis)
+            if ev == "IN":
+                self.gate.transfer_identity('T-ENT', self.mgr.local_to_global['T-ENT'])
+
+        self.assertIn("P-001", self.mgr.persons)
+        # Lost without triggering departure
+        self.mgr.process_detections([], {}, 10.0, 100, gate_counter=self.gate, frame_w=w, frame_h=h)
+        self.assertEqual(self.mgr.persons["P-001"].status, "TEMPORARILY_LOST")
+
+        # Now re-enters through the gate with new local track ID T-REIN
+        for fi in range(20, 30):
+            t = 20.0 + (fi - 20) * 0.1
+            y = 350 + (fi - 20) * 30
+            det_rein = [{'camera_id': 'cam1', 'track_id': 'T-REIN', 'bbox': (300, int(y - 90), 370, int(y)), 'conf': 0.95}]
+            self.mgr.process_detections(det_rein, {'T-REIN': f_vis}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h, clothing_map={'T-REIN': c_vis})
+            ev_rein = self.gate.check('T-REIN', det_rein[0]['bbox'], w, h, timestamp=t, camera_id='cam1', feat=f_vis)
+            if ev_rein == "IN":
+                self.gate.transfer_identity('T-REIN', self.mgr.local_to_global['T-REIN'])
+
+        # Must recover original P-001 and NOT create P-002
+        self.assertEqual(self.mgr.local_to_global.get('T-REIN'), "P-001")
+        self.assertEqual(len(self.mgr.persons), 1)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

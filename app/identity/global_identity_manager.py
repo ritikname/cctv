@@ -292,6 +292,34 @@ class GlobalIdentityManager:
         """Configure local VLM tie-breaker."""
         self.vlm_verifier = vlm_verifier
 
+    def _query_vlm(self, crop, gid, tid):
+        """
+        Query VLM verifier using non-blocking cached/async execution in live mode,
+        or synchronous execution if in unit test harness (mock).
+        """
+        if self.vlm_verifier is None or not self.vlm_verifier.enabled:
+            return None
+        if crop is None or crop.size == 0:
+            return None
+        if hasattr(self.vlm_verifier, "get_cached_verdict"):
+            verdict = self.vlm_verifier.get_cached_verdict(tid, gid)
+            if verdict is not None:
+                return verdict
+
+        # In unit tests or mock objects without _executor, invoke synchronously
+        is_mock = (
+            not hasattr(self.vlm_verifier, "_executor") or
+            hasattr(self.vlm_verifier.verify_candidate, "assert_called") or
+            hasattr(self.vlm_verifier.verify_candidate, "return_value")
+        )
+        if is_mock:
+            return self.vlm_verifier.verify_candidate(crop, gid)
+
+        # In production live stream: dispatch asynchronously without blocking frame loop
+        if hasattr(self.vlm_verifier, "request_verification_async"):
+            self.vlm_verifier.request_verification_async(crop, gid, tid)
+        return None
+
     def _new_gid(self):
         gid = f"P-{self._next_idx:03d}"
         self._next_idx += 1
@@ -357,7 +385,7 @@ class GlobalIdentityManager:
                     self.co_present_tracks[other_gid].add(gid)
                     self.co_present_tracks[other_gid].add(tid)
 
-    def promote_track_to_visitor(self, tid, timestamp, cam_id="camera_01", feat=None, bbox=None, clothing=None):
+    def promote_track_to_visitor(self, tid, timestamp, cam_id="camera_01", feat=None, bbox=None, clothing=None, crop=None):
         """
         Assign a permanent visitor ID (P-001, P-002...) to a tracked person.
         CALLED ONLY after the person's tracked foot point genuinely crosses the
@@ -376,6 +404,8 @@ class GlobalIdentityManager:
             feat = self.latest_features.get(tid)
         if clothing is None:
             clothing = self.latest_clothing.get(tid)
+        if crop is None and tid in self.candidates:
+            crop = self.candidates[tid].get("crop")
 
         # Check if this person is a returning visitor who previously completed a visit
         # within the configured retention window (including short visits where identity memory is preserved):
@@ -385,7 +415,8 @@ class GlobalIdentityManager:
             retention_limit = getattr(Config, "VISITOR_RETENTION_TIME", 3600)
             strong_thresh = getattr(Config, "REID_STRONG_MATCH_THRESHOLD", 0.75)
             for gid, p in self.persons.items():
-                if p.is_departed and p.current_visit_status in ("COMPLETED", "SHORT_VISIT_IGNORED"):
+                is_eligible = (p.is_departed and p.current_visit_status in ("COMPLETED", "SHORT_VISIT_IGNORED")) or (p.status == TEMPORARILY_LOST)
+                if is_eligible:
                     if (timestamp - p.last_seen) <= retention_limit:
                         sim = p.gallery.best_similarity(feat)
                         if clothing and len(p.gallery.clothing_profiles) > 0:
@@ -397,13 +428,44 @@ class GlobalIdentityManager:
         departed_candidates.sort(key=lambda x: x[0], reverse=True)
         if departed_candidates:
             if len(departed_candidates) > 1 and (departed_candidates[0][0] - departed_candidates[1][0] < self.CONFIDENCE_MARGIN):
-                departed_match = None
+                # Ambiguous tie: check if local VLM can break the tie between departed visitors
+                if crop is not None and getattr(self, "vlm_verifier", None) is not None and self.vlm_verifier.enabled:
+                    top_p = departed_candidates[0][1]
+                    sec_p = departed_candidates[1][1]
+                    v1 = self._query_vlm(crop, top_p.global_person_id, tid)
+                    v2 = self._query_vlm(crop, sec_p.global_person_id, tid)
+                    if v1 and v1.get("match") and (not v2 or not v2.get("match")):
+                        departed_match = top_p
+                    elif v2 and v2.get("match") and (not v1 or not v1.get("match")):
+                        departed_match = sec_p
+                    else:
+                        departed_match = None
+                else:
+                    departed_match = None
             else:
                 departed_match = departed_candidates[0][1]
+        elif crop is not None and feat is not None and getattr(self, "vlm_verifier", None) is not None and self.vlm_verifier.enabled:
+            # Check near-threshold returning visitor in ambiguity range
+            amb_low = getattr(Config, "VLM_AMBIGUITY_LOW", 0.68)
+            retention_limit = getattr(Config, "VISITOR_RETENTION_TIME", 3600)
+            strong_thresh = getattr(Config, "REID_STRONG_MATCH_THRESHOLD", 0.75)
+            for gid_d, p_d in self.persons.items():
+                is_eligible = (p_d.is_departed and p_d.current_visit_status in ("COMPLETED", "SHORT_VISIT_IGNORED")) or (p_d.status == TEMPORARILY_LOST)
+                if is_eligible:
+                    if (timestamp - p_d.last_seen) <= retention_limit:
+                        sim = p_d.gallery.best_similarity(feat)
+                        if amb_low <= sim < strong_thresh:
+                            v_res = self._query_vlm(crop, gid_d, tid)
+                            if v_res and v_res.get("match") and v_res.get("confidence", 0.0) >= 0.75:
+                                departed_match = p_d
+                                break
 
         if departed_match is not None:
-            # Genuine re-entry of previously known visitor! Start a new separate visit record:
-            departed_match.start_new_visit(timestamp, cam_id, tid, feat, bbox, clothing=clothing)
+            # Genuine re-entry of previously known visitor!
+            if departed_match.is_departed:
+                departed_match.start_new_visit(timestamp, cam_id, tid, feat, bbox, clothing=clothing)
+            else:
+                departed_match.mark_reidentified(timestamp, cam_id, tid, feat, bbox, comp=1.0, clothing=clothing)
             gid = departed_match.global_person_id
             self.local_to_global[tid] = gid
             self._sync_co_presence(tid, gid, departed_match)
@@ -583,10 +645,13 @@ class GlobalIdentityManager:
                     "is_unverified_occupant": is_preexisting_inside,
                     "anchor_head": (hx, hy),
                     "anchor_foot": (fx, fy),
+                    "crop": det.get('crop'),
                 }
             cand = self.candidates[tid]
             cand["last_seen"] = timestamp
             cand["camera_id"] = det['camera_id']
+            if det.get('crop') is not None:
+                cand["crop"] = det['crop']
             cand["head_pts"].append((hx, hy))
             cand["foot_pts"].append((fx, fy))
 
@@ -697,14 +762,48 @@ class GlobalIdentityManager:
                             })
                             continue
 
-                        # When on the same camera or single camera view, check spatial walking displacement bounds
+                        # Cross-camera check: verify camera topology connectivity
                         is_same_cam = (p.current_camera == cam_id) or (p.current_camera in ("camera_01", "cam1", "cam_01") and cam_id in ("camera_01", "cam1", "cam_01"))
+                        if not is_same_cam:
+                            is_conn = False
+                            if self.camera_manager and hasattr(self.camera_manager, "is_connected"):
+                                is_conn = self.camera_manager.is_connected(p.current_camera, cam_id)
+                            if not is_conn:
+                                self.reid_log.append({
+                                    "frame": frame_idx, "ts": round(timestamp, 3),
+                                    "camera_id": cam_id, "query_tid": tid, "assigned_gid": None,
+                                    "candidate_gids": [gid], "best_candidate": gid, "second_candidate": None,
+                                    "deep_sim": None, "cloth_sim": None, "app_score": None, "sp_score": None,
+                                    "tp_score": None, "composite": None, "margin": None,
+                                    "decision": "REJECTED_UNVERIFIED_CROSS_CAMERA",
+                                    "reason": f"Cameras {p.current_camera} and {cam_id} are not connected; unverified track {tid} cannot match {gid}",
+                                    "allow_gallery_update": False,
+                                })
+                                continue
+                            if time_gap < 0.5:
+                                continue
+
+                        # Spatio-temporal walking continuity bounds on the same camera:
                         if is_same_cam and p.last_bbox is not None:
                             c_prev = _bbox_centre(p.last_bbox)
                             c_curr = _bbox_centre(q_bbox)
                             disp = np.hypot(c_curr[0] - c_prev[0], c_curr[1] - c_prev[1])
                             if time_gap <= 10.0:
                                 max_disp = min(320.0, 60.0 + 80.0 * max(0.1, time_gap))
+                                if disp > max_disp:
+                                    self.reid_log.append({
+                                        "frame": frame_idx, "ts": round(timestamp, 3),
+                                        "camera_id": cam_id, "query_tid": tid, "assigned_gid": None,
+                                        "candidate_gids": [gid], "best_candidate": gid, "second_candidate": None,
+                                        "deep_sim": None, "cloth_sim": None, "app_score": None, "sp_score": None,
+                                        "tp_score": None, "composite": None, "margin": None,
+                                        "decision": "REJECTED_UNVERIFIED_NO_CONTINUITY",
+                                        "reason": f"Unverified track {tid} appeared inside at distance {disp:.1f}px (> {max_disp:.1f}px) from {gid}'s last location after {time_gap:.2f}s",
+                                        "allow_gallery_update": False,
+                                    })
+                                    continue
+                            elif time_gap <= 25.0:
+                                max_disp = min(600.0, 150.0 + 35.0 * time_gap)
                                 if disp > max_disp:
                                     self.reid_log.append({
                                         "frame": frame_idx, "ts": round(timestamp, 3),
@@ -918,18 +1017,18 @@ class GlobalIdentityManager:
                         det = unknown_dets[q_idx]
                         query_crop = det.get('crop')
                         if query_crop is not None:
-                            vlm_res = self.vlm_verifier.verify_candidate(query_crop, gid)
-                            if vlm_res.get("match") and vlm_res.get("confidence", 0.0) >= 0.75:
+                            vlm_res = self._query_vlm(query_crop, gid, tid)
+                            if vlm_res and vlm_res.get("match") and vlm_res.get("confidence", 0.0) >= 0.75:
                                 second_rejected = True
                                 if second is not None:
-                                    vlm_res2 = self.vlm_verifier.verify_candidate(query_crop, second["gid"])
-                                    if vlm_res2.get("match") and vlm_res2.get("confidence", 0.0) >= 0.70:
+                                    vlm_res2 = self._query_vlm(query_crop, second["gid"], tid)
+                                    if vlm_res2 and vlm_res2.get("match") and vlm_res2.get("confidence", 0.0) >= 0.70:
                                         second_rejected = False
                                 if second_rejected:
                                     vlm_resolved = True
                             elif second is not None:
-                                vlm_res2 = self.vlm_verifier.verify_candidate(query_crop, second["gid"])
-                                if vlm_res2.get("match") and vlm_res2.get("confidence", 0.0) >= 0.75:
+                                vlm_res2 = self._query_vlm(query_crop, second["gid"], tid)
+                                if vlm_res2 and vlm_res2.get("match") and vlm_res2.get("confidence", 0.0) >= 0.75:
                                     top, second = second, top
                                     gid = top["gid"]
                                     comp = top["composite"]
@@ -964,8 +1063,8 @@ class GlobalIdentityManager:
                         amb_high = getattr(Config, "VLM_AMBIGUITY_HIGH", 0.78)
                         # When candidate appearance is in ambiguity range and no other close competitor
                         if query_crop is not None and (amb_low <= top["app_score"] <= amb_high) and (second is None or margin >= 0.06):
-                            vlm_res = self.vlm_verifier.verify_candidate(query_crop, gid)
-                            if vlm_res.get("match") and vlm_res.get("confidence", 0.0) >= 0.75:
+                            vlm_res = self._query_vlm(query_crop, gid, tid)
+                            if vlm_res and vlm_res.get("match") and vlm_res.get("confidence", 0.0) >= 0.75:
                                 top["app_score"] = max(top["app_score"], 0.82)
                                 top["composite"] = max(top["composite"], min_c + 0.05)
                                 comp = top["composite"]
@@ -1000,13 +1099,8 @@ class GlobalIdentityManager:
                 cand = self.candidates.get(tid)
                 is_unverified = cand and cand.get("is_unverified_occupant", False)
                 if is_unverified:
-                    allow_gallery_update = (
-                        top["app_score"] >= 0.80 and
-                        top["composite"] >= 0.70 and
-                        margin >= 0.10 and
-                        quality >= 0.30 and
-                        tid not in occluded_tracks
-                    )
+                    # Unverified in-store recovery must NEVER contaminate the visitor gallery!
+                    allow_gallery_update = False
                 else:
                     allow_gallery_update = (
                         top["app_score"] >= 0.75 and

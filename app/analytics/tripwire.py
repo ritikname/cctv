@@ -322,6 +322,7 @@ class TripwireCounter:
         camera_id: str = "camera_01",
         feat: Optional[np.ndarray] = None,
         clothing: Optional[object] = None,
+        crop: Optional[np.ndarray] = None,
     ) -> Optional[str]:
         """
         Evaluate if a tracked person crossed the tripwire on this frame.
@@ -434,7 +435,7 @@ class TripwireCounter:
                         self.register_entry(person_id, timestamp)
                     elif self.identity_manager is not None:
                         promoted_gid = self.identity_manager.promote_track_to_visitor(
-                            person_id, timestamp, camera_id, feat, bbox, clothing=clothing
+                            person_id, timestamp, camera_id, feat, bbox, clothing=clothing, crop=crop
                         )
                         self.transfer_identity(person_id, promoted_gid)
                         self.register_entry(promoted_gid, timestamp)
