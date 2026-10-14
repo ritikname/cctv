@@ -1,0 +1,49 @@
+# Python Bytecode and Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.cache/
+.pytest_cache/
+
+# Model Weights and Large Checkpoints (See MODELS.md for download & reference)
+*.pt
+*.pth
+*.bin
+*.onnx
+*.engine
+*.tflite
+*.weights
+*.param
+*.xml
+yolo11x-pose_openvino_model/
+
+# Video, Media, and Scratch Image Dumps
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.jpg
+*.jpeg
+*.png
+*.pdf
+
+# Analytics Outputs and Run Dumps
+outputs/
+identity_debug.csv
+analytics_output.json
+similarity_stats.json
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# IDE and OS Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
