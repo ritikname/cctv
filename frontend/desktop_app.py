@@ -62,6 +62,16 @@ class VideoProcessorThread(QObject):
         self.tripwire = TripwireCounter(point_a=p1, point_b=p2, inside_direction=self.gate_dir)
         self.tripwire.group_detector = self.processor.group_detector
 
+        # Local VLM Verifier (Ollama)
+        from app.reid.vlm_verifier import VLMVerifier
+        self.vlm_verifier = VLMVerifier(
+            base_url=getattr(Config, "VLM_BASE_URL", "http://localhost:11434"),
+            model=getattr(Config, "VLM_MODEL", "qwen3.5:2b-q4_K_M"),
+            enabled=getattr(Config, "VLM_ENABLED", False),
+            timeout=getattr(Config, "VLM_TIMEOUT", 3.0),
+        )
+        self.processor.identity_manager.set_vlm_verifier(self.vlm_verifier)
+
         self.running  = True
         frame_idx     = 0
         id_mgr        = self.processor.identity_manager
@@ -130,8 +140,9 @@ class VideoProcessorThread(QObject):
                         extract = True          # Unknown → must Re-ID
                     else:
                         gid = id_mgr.local_to_global[tid]
-                        p   = id_mgr.persons[gid]
-                        if (p.gallery.size() < 3
+                        p   = id_mgr.persons.get(gid)
+                        if p and (p.gallery.is_empty()
+                                or p.gallery.size() < 3
                                 or current_frame_idx % Config.GALLERY_UPDATE_INTERVAL == 0):
                             extract = True
 
@@ -183,6 +194,8 @@ class VideoProcessorThread(QObject):
                         dec['global_id'] = current_gid
                         if event == "IN":
                             dec['state'] = "NEW"
+                            if det.get('crop') is not None and getattr(self, "vlm_verifier", None):
+                                self.vlm_verifier.store_reference_crop(current_gid, det['crop'])
 
                 # Check doorway departures among registered people who were inside and departed through the door
                 lost_gids = set(id_mgr.persons.keys()) - active_gids

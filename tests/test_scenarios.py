@@ -2306,6 +2306,303 @@ class TestGateIdentityAndGroupCountingBugs(unittest.TestCase):
                                 "Cosine similarity invariant to batch order must be >= 0.9999")
 
 
+# ── Issue 10: Robust Identity Association, Occlusion vs Unverified, & Local VLM Tests ──
+class TestRobustIdentityAndVLMRegression(unittest.TestCase):
+    def setUp(self):
+        from app.identity.global_identity_manager import GlobalIdentityManager
+        from app.analytics.tripwire import TripwireCounter
+        from app.analytics.group_detector import GroupDetector
+        from app.cameras.camera_manager import CameraManager
+        from app.reid.vlm_verifier import VLMVerifier
+        from app.config import Config
+
+        self.cam_mgr = CameraManager()
+        self.cam_mgr.add_camera("cam1", "cam1")
+        self.mgr = GlobalIdentityManager(self.cam_mgr, require_candidate_motion=True)
+        self.gd = GroupDetector(entry_window_sec=2.0, exit_window_sec=2.0)
+        self.gate = TripwireCounter(point_a=(0.0, 0.5), point_b=(1.0, 0.5), inside_direction="below")
+        self.gate.group_detector = self.gd
+        self.gate.identity_manager = self.mgr
+        self.mgr.gate_counter = self.gate
+        Config.REID_MATCH_THRESHOLD = 0.75
+        Config.ACTIVE_VISITOR_REID_THRESHOLD = 0.75
+
+    # 1. Non-overlap unverified occupant appearing AFTER visitor is lost must NOT inherit P-ID
+    def test_unverified_occupant_appearing_after_visitor_lost_cannot_steal_id(self):
+        w, h = 1000, 1000
+        f_visitor = _feat()
+        c_visitor = _clothing(upper_h=0.15, lower_h=0.65)
+
+        # Candidate has almost identical features and clothing
+        f_unverified = _close(f_visitor)
+        c_unverified = _clothing(upper_h=0.15, lower_h=0.65)
+
+        # Visitor enters and crosses gate between t=1.0 and 2.0s
+        for fi in range(10, 20):
+            t = fi * 0.1
+            y = 350 + (fi - 10) * 30
+            det = [{'camera_id': 'cam1', 'track_id': 'T-VISITOR', 'bbox': (400, int(y - 90), 470, int(y)), 'conf': 0.95}]
+            d = self.mgr.process_detections(det, {'T-VISITOR': f_visitor}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h, clothing_map={'T-VISITOR': c_visitor})
+            ev = self.gate.check('T-VISITOR', det[0]['bbox'], w, h, timestamp=t, camera_id='cam1', feat=f_visitor, clothing=c_visitor)
+            if ev == "IN":
+                gid = self.mgr.local_to_global['T-VISITOR']
+                self.gate.transfer_identity('T-VISITOR', gid)
+
+        gid_visitor = self.mgr.local_to_global.get('T-VISITOR')
+        self.assertIsNotNone(gid_visitor)
+        self.assertTrue(gid_visitor.startswith("P-"))
+        orig_gallery_size = self.mgr.persons[gid_visitor].gallery.size()
+
+        # Visitor is lost at t=4.0s
+        self.mgr.process_detections([], {}, 4.0, 40, gate_counter=self.gate)
+        self.assertEqual(self.mgr.persons[gid_visitor].status, "TEMPORARILY_LOST")
+
+        # At t=8.0s (4 seconds later), a completely new track T-UNV first appears inside the store
+        # Location is deep in another area (850, 750) > 400px away from visitor's last location
+        # Importantly, T-UNV NEVER co-existed in time with T-VISITOR (no frame overlap)
+        det_unv = [{'camera_id': 'cam1', 'track_id': 'T-UNV', 'bbox': (850, 750, 920, 850), 'conf': 0.94}]
+        d_res = self.mgr.process_detections(
+            det_unv, {'T-UNV': f_unverified}, 8.0, 80,
+            gate_counter=self.gate, frame_w=w, frame_h=h,
+            clothing_map={'T-UNV': c_unverified}
+        )
+
+        # Verification: T-UNV must NOT receive gid_visitor!
+        self.assertEqual(len(d_res), 1)
+        self.assertEqual(d_res[0]['global_id'], 'T-UNV', "Unverified track appearing without continuity must NOT inherit visitor ID")
+        self.assertEqual(d_res[0]['state'], 'UNVERIFIED_OCCUPANT')
+        self.assertNotIn('T-UNV', self.mgr.local_to_global)
+        # Visitor P-001 must remain TEMPORARILY_LOST
+        self.assertEqual(self.mgr.persons[gid_visitor].status, "TEMPORARILY_LOST")
+        # Visitor gallery must NOT have been updated by unverified track
+        self.assertEqual(self.mgr.persons[gid_visitor].gallery.size(), orig_gallery_size)
+        # Gate entry count must remain 1 after visit duration confirms
+        self.gate.confirm_pending_visits(10.0)
+        self.assertEqual(self.gate.entry_count, 1)
+
+    # 2. Legitimate in-store occlusion recovery (Case A) succeeds with credible continuity
+    def test_legitimate_in_store_occlusion_recovery_succeeds(self):
+        w, h = 1000, 1000
+        f_visitor = _feat()
+        c_visitor = _clothing(upper_h=0.20, lower_h=0.70)
+
+        # Visitor enters and crosses gate
+        for fi in range(10, 20):
+            t = fi * 0.1
+            y = 350 + (fi - 10) * 30
+            det = [{'camera_id': 'cam1', 'track_id': 'T-VISITOR', 'bbox': (400, int(y - 90), 470, int(y)), 'conf': 0.95}]
+            self.mgr.process_detections(det, {'T-VISITOR': f_visitor}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h, clothing_map={'T-VISITOR': c_visitor})
+            ev = self.gate.check('T-VISITOR', det[0]['bbox'], w, h, timestamp=t, camera_id='cam1', feat=f_visitor, clothing=c_visitor)
+            if ev == "IN":
+                gid = self.mgr.local_to_global['T-VISITOR']
+                self.gate.transfer_identity('T-VISITOR', gid)
+
+        gid_visitor = self.mgr.local_to_global['T-VISITOR']
+        last_bbox = self.mgr.persons[gid_visitor].last_bbox
+
+        # Briefly occluded at t=3.0s (1.0s gap)
+        self.mgr.process_detections([], {}, 3.0, 30, gate_counter=self.gate)
+        self.assertEqual(self.mgr.persons[gid_visitor].status, "TEMPORARILY_LOST")
+
+        # Track re-emerges with new tracker ID 'T-RECOVERED' at nearby position (35px away)
+        # with identical appearance and clothing at t=3.8s (0.8s gap <= 15s)
+        nearby_bbox = (last_bbox[0] + 25, last_bbox[1] + 25, last_bbox[2] + 25, last_bbox[3] + 25)
+        f_recov = _close(f_visitor)
+        det_recov = [{'camera_id': 'cam1', 'track_id': 'T-RECOVERED', 'bbox': nearby_bbox, 'conf': 0.93}]
+        d_recov = self.mgr.process_detections(
+            det_recov, {'T-RECOVERED': f_recov}, 3.8, 38,
+            gate_counter=self.gate, frame_w=w, frame_h=h,
+            clothing_map={'T-RECOVERED': c_visitor}
+        )
+
+        # Verification: Credible spatio-temporal continuity allows successful recovery
+        self.assertEqual(len(d_recov), 1)
+        self.assertEqual(d_recov[0]['global_id'], gid_visitor, "Nearby occluded visitor must be recovered")
+        self.assertEqual(d_recov[0]['state'], "REIDENTIFIED")
+        self.assertEqual(self.mgr.persons[gid_visitor].status, "REIDENTIFIED")
+        self.assertEqual(self.mgr.local_to_global['T-RECOVERED'], gid_visitor)
+
+    # 3. Confirmed visitor who pauses or stands still inside is never demoted to STATUE
+    def test_confirmed_visitor_standing_still_never_demoted_to_statue(self):
+        w, h = 1000, 1000
+        f_visitor = _feat()
+        c_visitor = _clothing(upper_h=0.10, lower_h=0.50)
+
+        # Visitor enters and crosses gate
+        for fi in range(10, 20):
+            t = fi * 0.1
+            y = 350 + (fi - 10) * 30
+            det = [{'camera_id': 'cam1', 'track_id': 'T-VISITOR', 'bbox': (400, int(y - 90), 470, int(y)), 'conf': 0.95}]
+            self.mgr.process_detections(det, {'T-VISITOR': f_visitor}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h, clothing_map={'T-VISITOR': c_visitor})
+            ev = self.gate.check('T-VISITOR', det[0]['bbox'], w, h, timestamp=t, camera_id='cam1', feat=f_visitor, clothing=c_visitor)
+            if ev == "IN":
+                gid = self.mgr.local_to_global['T-VISITOR']
+                self.gate.transfer_identity('T-VISITOR', gid)
+
+        gid_visitor = self.mgr.local_to_global['T-VISITOR']
+
+        # Visitor stands completely still for 50 frames (5 seconds)
+        still_bbox = (400, 600, 470, 700)
+        for fi in range(25, 75):
+            t = fi * 0.1
+            det = [{'camera_id': 'cam1', 'track_id': 'T-VISITOR', 'bbox': still_bbox, 'conf': 0.95}]
+            d = self.mgr.process_detections(det, {'T-VISITOR': f_visitor}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h)
+            self.assertEqual(d[0]['global_id'], gid_visitor, "Standing visitor must retain persistent ID")
+            self.assertNotEqual(d[0]['global_id'], "STATUE", "Standing visitor must NEVER be renamed to STATUE")
+
+        p = self.mgr.persons[gid_visitor]
+        self.assertFalse(p.is_static, "Confirmed visitor is_static must remain False")
+        self.assertTrue(getattr(p, 'is_stationary', False), "Standing visitor should be flagged is_stationary")
+
+    # 4. Stationary statue with bounding box jitter never gets P-ID or gate count
+    def test_statue_with_jitter_never_gets_pid_or_gate_count(self):
+        w, h = 1000, 1000
+        f_statue = _feat()
+
+        # Statue placed near threshold with small jitter (+/- 2 pixels) for 30 frames
+        for fi in range(1, 35):
+            t = fi * 0.1
+            jitter = (fi % 3) - 1
+            bbox = (300 + jitter, 430 + jitter, 360 + jitter, 530 + jitter)
+            det = [{'camera_id': 'cam1', 'track_id': 'T-STATUE', 'bbox': bbox, 'conf': 0.90}]
+            d = self.mgr.process_detections(det, {'T-STATUE': f_statue}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h)
+            is_statue = (d[0]['global_id'] == "STATUE")
+            ev = self.gate.check('T-STATUE', bbox, w, h, is_static=is_statue, timestamp=t)
+            self.assertIsNone(ev, "Statue must never trigger an IN event")
+
+        # After 15+ frames, it must be recognized as STATUE / STATIC
+        self.assertEqual(d[0]['global_id'], "STATUE")
+        self.assertEqual(d[0]['state'], "STATIC")
+        self.assertEqual(self.gate.entry_count, 0, "Statue must never count as visitor entry")
+        self.assertNotIn('T-STATUE', self.mgr.local_to_global)
+
+    # 5. Local VLMVerifier gracefully handles offline Ollama
+    def test_vlm_verifier_offline_graceful_fallback(self):
+        from app.reid.vlm_verifier import VLMVerifier
+        # Port 59999 is guaranteed to have no server running
+        vlm = VLMVerifier(base_url="http://localhost:59999", enabled=True, timeout=0.5)
+
+        crop_ref = np.zeros((100, 50, 3), dtype=np.uint8)
+        crop_query = np.zeros((100, 50, 3), dtype=np.uint8)
+
+        vlm.store_reference_crop("P-001", crop_ref)
+        res = vlm.verify_candidate(crop_query, "P-001")
+
+        self.assertIsInstance(res, dict)
+        self.assertFalse(res["match"])
+        self.assertEqual(res["status"], "UNAVAILABLE")
+        self.assertIn("unavailable", res["reason"].lower())
+
+    # 6. VLM cannot override hard gate or continuity rules
+    def test_vlm_cannot_override_continuity_rules(self):
+        from app.reid.vlm_verifier import VLMVerifier
+        from unittest.mock import MagicMock
+
+        w, h = 1000, 1000
+        f_visitor = _feat()
+        c_visitor = _clothing(upper_h=0.30, lower_h=0.70)
+
+        # Setup mock VLM that claims match is ALWAYS True
+        mock_vlm = VLMVerifier(enabled=True)
+        mock_vlm.verify_candidate = MagicMock(return_value={"match": True, "confidence": 0.99, "reason": "Mocked positive", "status": "SUCCESS"})
+        self.mgr.set_vlm_verifier(mock_vlm)
+
+        # Visitor enters
+        for fi in range(10, 20):
+            t = fi * 0.1
+            y = 350 + (fi - 10) * 30
+            det = [{'camera_id': 'cam1', 'track_id': 'T-VISITOR', 'bbox': (400, int(y - 90), 470, int(y)), 'conf': 0.95}]
+            self.mgr.process_detections(det, {'T-VISITOR': f_visitor}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h, clothing_map={'T-VISITOR': c_visitor})
+            ev = self.gate.check('T-VISITOR', det[0]['bbox'], w, h, timestamp=t, camera_id='cam1', feat=f_visitor, clothing=c_visitor)
+            if ev == "IN":
+                gid = self.mgr.local_to_global['T-VISITOR']
+                self.gate.transfer_identity('T-VISITOR', gid)
+
+        gid_visitor = self.mgr.local_to_global['T-VISITOR']
+
+        # Visitor is lost
+        self.mgr.process_detections([], {}, 4.0, 40, gate_counter=self.gate)
+
+        # An unverified track appears far away (x=900, y=850) with broken continuity
+        f_fake = _close(f_visitor)
+        det_fake = [{'camera_id': 'cam1', 'track_id': 'T-FAKE', 'bbox': (850, 800, 920, 900), 'conf': 0.95}]
+        d_res = self.mgr.process_detections(
+            det_fake, {'T-FAKE': f_fake}, 5.0, 50,
+            gate_counter=self.gate, frame_w=w, frame_h=h,
+            clothing_map={'T-FAKE': c_visitor}
+        )
+
+        # Verification: VLM cannot override Rule 7.5; track remains unverified!
+        self.assertEqual(d_res[0]['global_id'], 'T-FAKE')
+        self.assertEqual(d_res[0]['state'], 'UNVERIFIED_OCCUPANT')
+        self.assertNotIn('T-FAKE', self.mgr.local_to_global)
+
+    # 7. VLM resolves ambiguous candidate tie when enabled
+    def test_vlm_resolves_ambiguous_candidate_tie(self):
+        from app.reid.vlm_verifier import VLMVerifier
+        from unittest.mock import MagicMock
+
+        w, h = 1000, 1000
+        fA = _feat()
+        fB = _feat()  # distinct appearance so T-1 and T-2 get separate P-001 and P-002
+
+        # P-001 enters
+        for fi in range(10, 20):
+            t = fi * 0.1
+            y = 350 + (fi - 10) * 30
+            det = [{'camera_id': 'cam1', 'track_id': 'T-1', 'bbox': (300, int(y - 90), 370, int(y)), 'conf': 0.95}]
+            self.mgr.process_detections(det, {'T-1': fA}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h)
+            ev = self.gate.check('T-1', det[0]['bbox'], w, h, timestamp=t, camera_id='cam1', feat=fA)
+            if ev == "IN":
+                self.gate.transfer_identity('T-1', self.mgr.local_to_global['T-1'])
+
+        # P-002 enters
+        for fi in range(20, 30):
+            t = fi * 0.1
+            y = 350 + (fi - 20) * 30
+            det = [{'camera_id': 'cam1', 'track_id': 'T-2', 'bbox': (500, int(y - 90), 570, int(y)), 'conf': 0.95}]
+            self.mgr.process_detections(det, {'T-2': fB}, t, fi, gate_counter=self.gate, frame_w=w, frame_h=h)
+            ev = self.gate.check('T-2', det[0]['bbox'], w, h, timestamp=t, camera_id='cam1', feat=fB)
+            if ev == "IN":
+                self.gate.transfer_identity('T-2', self.mgr.local_to_global['T-2'])
+
+        gid1 = self.mgr.local_to_global['T-1']
+        gid2 = self.mgr.local_to_global['T-2']
+        self.assertEqual(gid1, "P-001")
+        self.assertEqual(gid2, "P-002")
+
+        # Both become temporarily lost
+        self.mgr.process_detections([], {}, 4.0, 40, gate_counter=self.gate)
+        self.assertEqual(self.mgr.persons[gid1].status, "TEMPORARILY_LOST")
+        self.assertEqual(self.mgr.persons[gid2].status, "TEMPORARILY_LOST")
+
+        # Mock VLM: confirms P-001, rejects P-002
+        mock_vlm = VLMVerifier(enabled=True)
+        def mock_verify(crop, gid):
+            if gid == "P-001":
+                return {"match": True, "confidence": 0.88, "reason": "Confirmed red shirt", "status": "SUCCESS"}
+            return {"match": False, "confidence": 0.20, "reason": "Mismatched attributes", "status": "SUCCESS"}
+        mock_vlm.verify_candidate = MagicMock(side_effect=mock_verify)
+        self.mgr.set_vlm_verifier(mock_vlm)
+
+        # Ambiguous query feature close to both P-001 and P-002
+        f_query = 0.50 * fA + 0.50 * fB
+        f_query /= float(np.linalg.norm(f_query))
+
+        # T-RECOV appears near center with crop
+        fake_crop = np.zeros((100, 50, 3), dtype=np.uint8)
+        det_query = [{'camera_id': 'cam1', 'track_id': 'T-QUERY', 'bbox': (310, 580, 380, 680), 'conf': 0.95, 'crop': fake_crop}]
+        d_res = self.mgr.process_detections(
+            det_query, {'T-QUERY': f_query}, 4.5, 45,
+            gate_counter=self.gate, frame_w=w, frame_h=h
+        )
+
+        # Verification: VLM tie-break resolves candidate to P-001
+        self.assertEqual(len(d_res), 1)
+        self.assertEqual(d_res[0]['global_id'], "P-001", "VLM should resolve tie to P-001")
+        self.assertEqual(d_res[0]['state'], "REIDENTIFIED")
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
 

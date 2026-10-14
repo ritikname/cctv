@@ -174,12 +174,13 @@ class GlobalPerson:
             self.head_history.append((hx, hy))
             self.foot_history.append((fx, fy))
 
-            # Evaluate rolling motion over the last 40-60 frames (1.5 - 2.0 seconds):
-            if len(self.head_history) >= 40:
-                h_pts = list(self.head_history)
-                f_pts = list(self.foot_history)
+            # Evaluate rolling motion over the last 20-25 frames (0.8 - 1.0 second):
+            if len(self.head_history) >= 20:
+                recent_n = min(len(self.head_history), 25)
+                h_pts = list(self.head_history)[-recent_n:]
+                f_pts = list(self.foot_history)[-recent_n:]
 
-                # Head trajectory: A statue's head is completely fixed on a stand/neck!
+                # Head trajectory
                 head_dx = h_pts[-1][0] - h_pts[0][0]
                 head_dy = h_pts[-1][1] - h_pts[0][1]
                 net_head_motion = np.hypot(head_dx, head_dy)
@@ -193,7 +194,7 @@ class GlobalPerson:
                 med_hy = np.median([p[1] for p in h_pts])
                 head_radius = max(np.hypot(p[0] - med_hx, p[1] - med_hy) for p in h_pts)
 
-                # If head and feet barely move across 40+ frames, they are temporarily stationary (paused)
+                # If head and feet barely move across recent frames, person is temporarily stationary (paused)
                 if head_radius < 14.0 and net_head_motion < 14.0 and net_foot_motion < 18.0:
                     self.is_stationary = True
                 elif net_head_motion > 24.0 or net_foot_motion > 28.0:
@@ -285,6 +286,11 @@ class GlobalIdentityManager:
         self._frame_diag    = None      # cached frame diagonal
         self.gate_counter   = None      # optional TripwireCounter reference
         self.reid_log       = []        # audit log of every Re-ID match attempt
+        self.vlm_verifier   = None      # optional local VLM tie-breaker (Ollama)
+
+    def set_vlm_verifier(self, vlm_verifier):
+        """Configure local VLM tie-breaker."""
+        self.vlm_verifier = vlm_verifier
 
     def _new_gid(self):
         gid = f"P-{self._next_idx:03d}"
@@ -362,6 +368,9 @@ class GlobalIdentityManager:
             if gid in self.persons:
                 self._sync_co_presence(tid, gid, self.persons[gid])
             return gid
+
+        if (cam_id == "camera_01" or cam_id is None) and tid in self.candidates and "camera_id" in self.candidates[tid]:
+            cam_id = self.candidates[tid]["camera_id"]
 
         if feat is None:
             feat = self.latest_features.get(tid)
@@ -566,6 +575,7 @@ class GlobalIdentityManager:
                 self.candidates[tid] = {
                     "first_seen": timestamp,
                     "last_seen": timestamp,
+                    "camera_id": det['camera_id'],
                     "head_pts": deque(maxlen=90),
                     "foot_pts": deque(maxlen=90),
                     "is_static": False,
@@ -576,6 +586,7 @@ class GlobalIdentityManager:
                 }
             cand = self.candidates[tid]
             cand["last_seen"] = timestamp
+            cand["camera_id"] = det['camera_id']
             cand["head_pts"].append((hx, hy))
             cand["foot_pts"].append((fx, fy))
 
@@ -656,7 +667,7 @@ class GlobalIdentityManager:
                     # unless there is strong, unambiguous evidence of genuine visitor recovery.
                     if cand and cand.get("is_unverified_occupant", False):
                         cand_first = cand.get("first_seen", timestamp)
-                        # If candidate was already present inside before p entered or while p was active:
+                        # Case C1: Track was already present inside before p entered or while p was active
                         if cand_first < p.first_seen or cand_first < (p.last_seen - 0.2):
                             self.reid_log.append({
                                 "frame": frame_idx, "ts": round(timestamp, 3),
@@ -669,6 +680,43 @@ class GlobalIdentityManager:
                                 "allow_gallery_update": False,
                             })
                             continue
+
+                        # Case A vs Case C2: Track first appeared inside after p was lost.
+                        # To qualify as in-store occlusion recovery (Case A), strict spatio-temporal continuity is required:
+                        time_gap = timestamp - p.last_seen
+                        if p.status != TEMPORARILY_LOST:
+                            self.reid_log.append({
+                                "frame": frame_idx, "ts": round(timestamp, 3),
+                                "camera_id": cam_id, "query_tid": tid, "assigned_gid": None,
+                                "candidate_gids": [gid], "best_candidate": gid, "second_candidate": None,
+                                "deep_sim": None, "cloth_sim": None, "app_score": None, "sp_score": None,
+                                "tp_score": None, "composite": None, "margin": None,
+                                "decision": "REJECTED_UNVERIFIED_NO_CONTINUITY",
+                                "reason": f"Track {tid} appeared inside without gate crossing; person {gid} is not temporarily lost (status={p.status})",
+                                "allow_gallery_update": False,
+                            })
+                            continue
+
+                        # When on the same camera or single camera view, check spatial walking displacement bounds
+                        is_same_cam = (p.current_camera == cam_id) or (p.current_camera in ("camera_01", "cam1", "cam_01") and cam_id in ("camera_01", "cam1", "cam_01"))
+                        if is_same_cam and p.last_bbox is not None:
+                            c_prev = _bbox_centre(p.last_bbox)
+                            c_curr = _bbox_centre(q_bbox)
+                            disp = np.hypot(c_curr[0] - c_prev[0], c_curr[1] - c_prev[1])
+                            if time_gap <= 10.0:
+                                max_disp = min(320.0, 60.0 + 80.0 * max(0.1, time_gap))
+                                if disp > max_disp:
+                                    self.reid_log.append({
+                                        "frame": frame_idx, "ts": round(timestamp, 3),
+                                        "camera_id": cam_id, "query_tid": tid, "assigned_gid": None,
+                                        "candidate_gids": [gid], "best_candidate": gid, "second_candidate": None,
+                                        "deep_sim": None, "cloth_sim": None, "app_score": None, "sp_score": None,
+                                        "tp_score": None, "composite": None, "margin": None,
+                                        "decision": "REJECTED_UNVERIFIED_NO_CONTINUITY",
+                                        "reason": f"Unverified track {tid} appeared inside at distance {disp:.1f}px (> {max_disp:.1f}px) from {gid}'s last location after {time_gap:.2f}s",
+                                        "allow_gallery_update": False,
+                                    })
+                                    continue
 
                     # Rule 8: Physical Store Invariants (gate counter)
                     if active_gate is not None:
@@ -800,8 +848,14 @@ class GlobalIdentityManager:
                 second = cands[1] if len(cands) > 1 else None
 
                 p = self.persons[top["gid"]]
-                min_c = 0.52 if p.status == TEMPORARILY_LOST else 0.56
-                min_a = getattr(Config, "ACTIVE_VISITOR_REID_THRESHOLD", 0.75) if p.status == TEMPORARILY_LOST else getattr(Config, "REID_MATCH_THRESHOLD", 0.75)
+                cand = self.candidates.get(unknown_dets[q_idx]['track_id'])
+                is_unverified = cand and cand.get("is_unverified_occupant", False)
+                if is_unverified:
+                    min_c = 0.65
+                    min_a = 0.75
+                else:
+                    min_c = 0.52 if p.status == TEMPORARILY_LOST else 0.56
+                    min_a = getattr(Config, "ACTIVE_VISITOR_REID_THRESHOLD", 0.75) if p.status == TEMPORARILY_LOST else getattr(Config, "REID_MATCH_THRESHOLD", 0.75)
 
                 if second is not None:
                     margin = float(top["composite"] - second["composite"])
@@ -848,23 +902,40 @@ class GlobalIdentityManager:
                     continue
 
                 if q_idx in ambiguous_qdx or gid in ambiguous_gids:
-                    # Defer ambiguous match! Never force an unreliable assignment
-                    self.reid_log.append({
-                        "frame": frame_idx, "ts": round(timestamp, 3),
-                        "camera_id": cam_id, "query_tid": tid, "assigned_gid": None,
-                        "candidate_gid": gid,
-                        "candidate_gids": evaluated_gids, "best_candidate": gid,
-                        "second_candidate": second["gid"] if second else None,
-                        "deep_sim": round(top["deep_sim"], 4), "cloth_sim": round(top["cloth_sim"], 4) if top["cloth_sim"] is not None else None,
-                        "app_score": round(top["app_score"], 4), "sp_score": round(top["sp_score"], 4),
-                        "tp_score": round(top["tp_score"], 4), "composite": round(comp, 4),
-                        "margin": round(margin, 4),
-                        "decision": "DEFERRED",
-                        "reason": f"Ambiguous candidates (margin {margin:.3f} < {self.CONFIDENCE_MARGIN}); deferred to prevent identity swap",
-                        "allow_gallery_update": False,
-                        "min_composite": min_c, "min_app": min_a,
-                    })
-                    continue
+                    # Check if local VLM verifier can provide second-stage tie-break
+                    vlm_resolved = False
+                    if getattr(self, "vlm_verifier", None) is not None and self.vlm_verifier.enabled:
+                        det = unknown_dets[q_idx]
+                        query_crop = det.get('crop')
+                        if query_crop is not None:
+                            vlm_res = self.vlm_verifier.verify_candidate(query_crop, gid)
+                            if vlm_res.get("match") and vlm_res.get("confidence", 0.0) >= 0.75:
+                                second_rejected = True
+                                if second is not None:
+                                    vlm_res2 = self.vlm_verifier.verify_candidate(query_crop, second["gid"])
+                                    if vlm_res2.get("match") and vlm_res2.get("confidence", 0.0) >= 0.70:
+                                        second_rejected = False
+                                if second_rejected:
+                                    vlm_resolved = True
+
+                    if not vlm_resolved:
+                        # Defer ambiguous match! Never force an unreliable assignment
+                        self.reid_log.append({
+                            "frame": frame_idx, "ts": round(timestamp, 3),
+                            "camera_id": cam_id, "query_tid": tid, "assigned_gid": None,
+                            "candidate_gid": gid,
+                            "candidate_gids": evaluated_gids, "best_candidate": gid,
+                            "second_candidate": second["gid"] if second else None,
+                            "deep_sim": round(top["deep_sim"], 4), "cloth_sim": round(top["cloth_sim"], 4) if top["cloth_sim"] is not None else None,
+                            "app_score": round(top["app_score"], 4), "sp_score": round(top["sp_score"], 4),
+                            "tp_score": round(top["tp_score"], 4), "composite": round(comp, 4),
+                            "margin": round(margin, 4),
+                            "decision": "DEFERRED",
+                            "reason": f"Ambiguous candidates (margin {margin:.3f} < {self.CONFIDENCE_MARGIN}); deferred to prevent identity swap",
+                            "allow_gallery_update": False,
+                            "min_composite": min_c, "min_app": min_a,
+                        })
+                        continue
 
                 # Threshold check
                 if top["composite"] < min_c or top["app_score"] < min_a:
@@ -893,13 +964,24 @@ class GlobalIdentityManager:
                 quality = self._compute_quality(det['bbox'])
 
                 # ── Gallery contamination protection ──
-                allow_gallery_update = (
-                    top["app_score"] >= 0.75 and
-                    top["composite"] >= 0.62 and
-                    margin >= 0.08 and
-                    quality >= 0.25 and
-                    tid not in occluded_tracks
-                )
+                cand = self.candidates.get(tid)
+                is_unverified = cand and cand.get("is_unverified_occupant", False)
+                if is_unverified:
+                    allow_gallery_update = (
+                        top["app_score"] >= 0.80 and
+                        top["composite"] >= 0.70 and
+                        margin >= 0.10 and
+                        quality >= 0.30 and
+                        tid not in occluded_tracks
+                    )
+                else:
+                    allow_gallery_update = (
+                        top["app_score"] >= 0.75 and
+                        top["composite"] >= 0.62 and
+                        margin >= 0.08 and
+                        quality >= 0.25 and
+                        tid not in occluded_tracks
+                    )
 
                 if p.current_track_id in self.local_to_global:
                     if self.local_to_global[p.current_track_id] == gid:
